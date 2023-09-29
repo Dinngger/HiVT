@@ -18,12 +18,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Batch
 from torch_geometric.data import Data
-from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.typing import Adj
-from torch_geometric.typing import OptTensor
-from torch_geometric.typing import Size
-from torch_geometric.utils import softmax
-from torch_geometric.utils import subgraph
+from mypyg.conv import MessagePassing
+from mypyg.typing import Adj
+from mypyg.typing import OptTensor
+from mypyg.typing import Size
+from mypyg.utils import softmax, subgraph, is_sparse
 
 from models import MultipleInputEmbedding
 from models import SingleInputEmbedding
@@ -199,6 +198,23 @@ class AAEncoder(MessagePassing):
         inputs = inputs.view(-1, self.embed_dim)
         gate = torch.sigmoid(self.lin_ih(inputs) + self.lin_hh(center_embed))
         return inputs + gate * (self.lin_self(center_embed) - inputs)
+
+    def propagate(self, edge_index, x, center_embed, edge_attr, rotate_mat, size):
+        size = self._check_input(edge_index, size)
+        assert not is_sparse(edge_index)
+
+        i, j = (1, 0)
+        center_embed_i = self._collect(center_embed, edge_index, size, i)
+        x_j = self._collect(x, edge_index, size, j)
+        
+        ptr = None
+        index = edge_index[i]
+        dim_size = size_i = size[i] if size[i] is not None else size[j]
+
+        out = self.message(edge_index, center_embed_i, x_j, edge_attr, rotate_mat, index, ptr, size_i)
+        out = self.aggregate(out, index, ptr, dim_size)
+        out = self.update(out, center_embed)
+        return out
 
     def _mha_block(self,
                    center_embed: torch.Tensor,
@@ -389,6 +405,26 @@ class ALEncoder(MessagePassing):
         inputs = inputs.view(-1, self.embed_dim)
         gate = torch.sigmoid(self.lin_ih(inputs) + self.lin_hh(x_actor))
         return inputs + gate * (self.lin_self(x_actor) - inputs)
+
+    def propagate(self, edge_index, x, edge_attr, is_intersections, turn_directions, traffic_controls, rotate_mat, size):
+        size = self._check_input(edge_index, size)
+        assert not is_sparse(edge_index)
+
+        i, j = (1, 0)
+        x_i = self._collect(x, edge_index, size, i)
+        x_j = self._collect(x, edge_index, size, j)
+        is_intersections_j = self._collect(is_intersections, edge_index, size, j)
+        turn_directions_j = self._collect(turn_directions, edge_index, size, j)
+        traffic_controls_j = self._collect(traffic_controls, edge_index, size, j)
+        
+        ptr = None
+        index = edge_index[i]
+        dim_size = size_i = size[i] if size[i] is not None else size[j]
+
+        out = self.message(edge_index, x_i, x_j, edge_attr, is_intersections_j, turn_directions_j, traffic_controls_j, rotate_mat, index, ptr, size_i)
+        out = self.aggregate(out, index, ptr, dim_size)
+        out = self.update(out, x)
+        return out
 
     def _mha_block(self,
                    x_actor: torch.Tensor,
