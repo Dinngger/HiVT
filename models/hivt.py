@@ -24,7 +24,7 @@ from metrics import MR
 from models import GlobalInteractor
 from models import LocalEncoder
 from models import MLPDecoder
-from utils import TemporalData
+from mypyg.data import Data
 
 
 class HiVT(pl.LightningModule):
@@ -87,7 +87,7 @@ class HiVT(pl.LightningModule):
         self.minFDE = FDE()
         self.minMR = MR()
 
-    def forward(self, data: TemporalData):
+    def forward(self, data: Data):
         if self.rotate:
             rotate_mat = torch.empty(data.num_nodes, 2, 2, device=self.device)
             sin_vals = torch.sin(data['rotate_angles'])

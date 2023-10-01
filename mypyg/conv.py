@@ -1,4 +1,3 @@
-from inspect import Parameter
 from typing import (
     Any,
     Tuple,
@@ -11,13 +10,6 @@ import torch
 from torch import Tensor
 from mypyg.utils import scatter
 
-from mypyg.typing import Adj, Size, SparseTensor
-from mypyg.utils import (
-    is_sparse,
-    is_torch_sparse_tensor,
-    ptr2index
-)
-
 
 class SumAggregation(torch.nn.Module):
     r"""An aggregation operator that sums up features across a set of elements
@@ -26,48 +18,12 @@ class SumAggregation(torch.nn.Module):
         \mathrm{sum}(\mathcal{X}) = \sum_{\mathbf{x}_i \in \mathcal{X}}
         \mathbf{x}_i.
     """
-    def forward(self, x: Tensor, index: Optional[Tensor] = None,
-                ptr: Optional[Tensor] = None, dim_size: Optional[int] = None,
-                dim: int = -2) -> Tensor:
-        return self.reduce(x, index, ptr, dim_size, dim, reduce='sum')
-    def __call__(self, x: Tensor, index: Optional[Tensor] = None,
-                 ptr: Optional[Tensor] = None, dim_size: Optional[int] = None,
-                 dim: int = -2, **kwargs) -> Tensor:
+    def forward(self, x: Tensor, index: Tensor,
+                dim_size: int, dim: int = -2) -> Tensor:
+        return self.reduce(x, index, dim_size, dim, reduce='sum')
 
-        if dim >= x.dim() or dim < -x.dim():
-            raise ValueError(f"Encountered invalid dimension '{dim}' of "
-                             f"source tensor with {x.dim()} dimensions")
-
-        if index is None and ptr is None:
-            index = x.new_zeros(x.size(dim), dtype=torch.long)
-
-        if ptr is not None:
-            if dim_size is None:
-                dim_size = ptr.numel() - 1
-            elif dim_size != ptr.numel() - 1:
-                raise ValueError(f"Encountered invalid 'dim_size' (got "
-                                 f"'{dim_size}' but expected "
-                                 f"'{ptr.numel() - 1}')")
-
-        if index is not None and dim_size is None:
-            dim_size = int(index.max()) + 1 if index.numel() > 0 else 0
-
-        try:
-            return super().__call__(x, index, ptr, dim_size, dim, **kwargs)
-        except (IndexError, RuntimeError) as e:
-            if index is not None:
-                if index.numel() > 0 and dim_size <= int(index.max()):
-                    raise ValueError(f"Encountered invalid 'dim_size' (got "
-                                     f"'{dim_size}' but expected "
-                                     f">= '{int(index.max()) + 1}')")
-            raise e
-    def __repr__(self) -> str:
-        return f'{self.__class__.__name__}()'
-    def reduce(self, x: Tensor, index: Optional[Tensor] = None,
-               ptr: Optional[Tensor] = None, dim_size: Optional[int] = None,
-               dim: int = -2, reduce: str = 'sum') -> Tensor:
-        assert ptr is None
-        assert index is not None
+    def reduce(self, x: Tensor, index: Tensor,
+               dim_size: int, dim: int = -2, reduce: str = 'sum') -> Tensor:
         return scatter(x, index, dim, dim_size, reduce)
 
 
@@ -131,11 +87,6 @@ class MessagePassing(torch.nn.Module):
             true for execution speedups. (default: :obj:`1`)
     """
 
-    special_args: Set[str] = {
-        'edge_index', 'adj_t', 'edge_index_i', 'edge_index_j', 'size',
-        'size_i', 'size_j', 'ptr', 'index', 'dim_size'
-    }
-
     def __init__(
         self,
         aggr: str = "add",
@@ -176,41 +127,8 @@ class MessagePassing(torch.nn.Module):
                  f'dimension {self.node_dim}, but expected size {the_size}.'))
 
     def _lift(self, src, edge_index, dim: int):
-        if is_torch_sparse_tensor(edge_index):
-            assert dim == 0 or dim == 1
-            if edge_index.layout == torch.sparse_coo:
-                index = edge_index._indices()[1 - dim]
-            elif edge_index.layout == torch.sparse_csr:
-                if dim == 0:
-                    index = edge_index.col_indices()
-                else:
-                    index = ptr2index(edge_index.crow_indices())
-            elif edge_index.layout == torch.sparse_csc:
-                if dim == 0:
-                    index = ptr2index(edge_index.ccol_indices())
-                else:
-                    index = edge_index.row_indices()
-            else:
-                raise ValueError(f"Unsupported sparse tensor layout "
-                                 f"(got '{edge_index.layout}')")
-            return src.index_select(self.node_dim, index)
-
-        elif isinstance(edge_index, Tensor):
-            index = edge_index[dim]
-            return src.index_select(self.node_dim, index)
-
-        elif isinstance(edge_index, SparseTensor):
-            if dim == 0:
-                col = edge_index.storage.col()
-                return src.index_select(self.node_dim, col)
-            elif dim == 1:
-                row = edge_index.storage.row()
-                return src.index_select(self.node_dim, row)
-
-        raise ValueError(
-            ('`MessagePassing.propagate` only supports integer tensors of '
-             'shape `[2, num_messages]`, `torch_sparse.SparseTensor` '
-             'or `torch.sparse.Tensor` for argument `edge_index`.'))
+        index = edge_index[dim]
+        return src.index_select(self.node_dim, index)
 
     def _collect_tuple(self, data: Tuple[Tensor, Tensor], edge_index, size: List[Optional[int]], dim: int):
         assert len(data) == 2
@@ -225,23 +143,8 @@ class MessagePassing(torch.nn.Module):
             data = self._lift(data, edge_index, dim)
         return data
 
-        out['adj_t'] = None
-        out['edge_index'] = edge_index
-        out['edge_index_i'] = edge_index[i]
-        out['edge_index_j'] = edge_index[j]
-        out['ptr'] = None
-
-        out['index'] = out['edge_index_i']
-        out['size'] = size
-        out['size_i'] = size[i] if size[i] is not None else size[j]
-        out['size_j'] = size[j] if size[j] is not None else size[i]
-        out['dim_size'] = out['size_i']
-
-        return out
-
     def aggregate(self, inputs: Tensor, index: Tensor,
-                  ptr: Optional[Tensor] = None,
-                  dim_size: Optional[int] = None) -> Tensor:
+                  dim_size: int) -> Tensor:
         r"""Aggregates messages from neighbors as
         :math:`\bigoplus_{j \in \mathcal{N}(i)}`.
 
@@ -252,5 +155,5 @@ class MessagePassing(torch.nn.Module):
         :class:`~torch_geometric.nn.aggr.Aggregation` module to reduce messages
         as specified in :meth:`__init__` by the :obj:`aggr` argument.
         """
-        return self.aggr_module(inputs, index, ptr=ptr, dim_size=dim_size,
+        return self.aggr_module(inputs, index, dim_size=dim_size,
                                 dim=self.node_dim)

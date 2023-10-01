@@ -15,13 +15,12 @@ from typing import List, Dict, Optional
 
 import torch
 import torch.nn as nn
+from mypyg.data import Data
 from mypyg.conv import MessagePassing
-from mypyg.typing import Adj, OptTensor
-from mypyg.utils import softmax, subgraph, is_sparse
+from mypyg.utils import softmax, subgraph
 
 from models import MultipleInputEmbedding
 from models import SingleInputEmbedding
-from utils import TemporalData
 from utils import init_weights
 
 
@@ -53,7 +52,7 @@ class GlobalInteractor(nn.Module):
         self.apply(init_weights)
 
     def forward(self,
-                data: TemporalData,
+                data: Data,
                 local_embed: torch.Tensor) -> torch.Tensor:
         edge_index, _ = subgraph(subset=~data['padding_mask'][:, self.historical_steps - 1], edge_index=data.edge_index)
         rel_pos = data['positions'][edge_index[0], self.historical_steps - 1] - data['positions'][
@@ -108,7 +107,7 @@ class GlobalInteractorLayer(MessagePassing):
 
     def forward(self,
                 x: torch.Tensor,
-                edge_index: Adj,
+                edge_index: torch.Tensor,
                 edge_attr: torch.Tensor) -> torch.Tensor:
         x = x + self._mha_block(self.norm1(x), edge_index, edge_attr)
         x = x + self._ff_block(self.norm2(x))
@@ -119,8 +118,7 @@ class GlobalInteractorLayer(MessagePassing):
                 x_j: torch.Tensor,
                 edge_attr: torch.Tensor,
                 index: torch.Tensor,
-                ptr: OptTensor,
-                size_i: Optional[int]) -> torch.Tensor:
+                size_i: int) -> torch.Tensor:
         query = self.lin_q_node(x_i).view(-1, self.num_heads, self.embed_dim // self.num_heads)
         key_node = self.lin_k_node(x_j).view(-1, self.num_heads, self.embed_dim // self.num_heads)
         key_edge = self.lin_k_edge(edge_attr).view(-1, self.num_heads, self.embed_dim // self.num_heads)
@@ -128,7 +126,7 @@ class GlobalInteractorLayer(MessagePassing):
         value_edge = self.lin_v_edge(edge_attr).view(-1, self.num_heads, self.embed_dim // self.num_heads)
         scale = (self.embed_dim // self.num_heads) ** 0.5
         alpha = (query * (key_node + key_edge)).sum(dim=-1) / scale
-        alpha = softmax(alpha, index, ptr, size_i)
+        alpha = softmax(alpha, index, size_i)
         alpha = self.attn_drop(alpha)
         return (value_node + value_edge) * alpha.unsqueeze(-1)
 
@@ -139,26 +137,24 @@ class GlobalInteractorLayer(MessagePassing):
         gate = torch.sigmoid(self.lin_ih(inputs) + self.lin_hh(x))
         return inputs + gate * (self.lin_self(x) - inputs)
 
-    def propagate(self, edge_index: Adj, x, edge_attr):
+    def propagate(self, edge_index: torch.Tensor, x, edge_attr):
         size: List[Optional[int]] = [None, None]
-        assert not is_sparse(edge_index)
 
         i, j = 1, 0
         x_i = self._collect(x, edge_index, size, i)
         x_j = self._collect(x, edge_index, size, j)
         
-        ptr = None
         index = edge_index[i]
         dim_size = size_i = size[i] if size[i] is not None else size[j]
 
-        out = self.message(x_i, x_j, edge_attr, index, ptr, size_i)
-        out = self.aggregate(out, index, ptr, dim_size)
+        out = self.message(x_i, x_j, edge_attr, index, size_i)
+        out = self.aggregate(out, index, dim_size)
         out = self.update(out, x)
         return out
 
     def _mha_block(self,
                    x: torch.Tensor,
-                   edge_index: Adj,
+                   edge_index: torch.Tensor,
                    edge_attr: torch.Tensor) -> torch.Tensor:
         x = self.out_proj(self.propagate(edge_index=edge_index, x=x, edge_attr=edge_attr))
         return self.proj_drop(x)

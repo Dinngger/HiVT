@@ -16,18 +16,13 @@ from typing import Optional, Tuple, List, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mypyg.data import Batch
-from mypyg.data import Data
+from mypyg.data import Data, combine_batch_data
 from mypyg.conv import MessagePassing
-from mypyg.typing import Adj
-from mypyg.typing import OptTensor
-from mypyg.typing import Size
-from mypyg.utils import softmax, subgraph, is_sparse
+from mypyg.utils import softmax, subgraph
 
 from models import MultipleInputEmbedding
 from models import SingleInputEmbedding
 from utils import DistanceDropEdge
-from utils import TemporalData
 from utils import init_weights
 
 
@@ -66,7 +61,7 @@ class LocalEncoder(nn.Module):
                                     num_heads=num_heads,
                                     dropout=dropout)
 
-    def forward(self, data: TemporalData) -> torch.Tensor:
+    def forward(self, data: Data) -> torch.Tensor:
         for t in range(self.historical_steps):
             data[f'edge_index_{t}'], _ = subgraph(subset=~data['padding_mask'][:, t], edge_index=data['edge_index'])
             data[f'edge_attr_{t}'] = \
@@ -77,7 +72,7 @@ class LocalEncoder(nn.Module):
             edge_index, edge_attr = self.drop_edge(data[f'edge_index_{t}'], data[f'edge_attr_{t}'])
             snapshots[t] = Data(x=data.x[:, t], edge_index=edge_index, edge_attr=edge_attr,
                                 num_nodes=data.num_nodes)
-        batch = Batch.from_data_list(snapshots)
+        batch = combine_batch_data(snapshots)
         out = self.aa_encoder(x=batch.x, t=None, edge_index=batch.edge_index, edge_attr=batch.edge_attr,
                                 bos_mask=data['bos_mask'], rotate_mat=data['rotate_mat'])
         out = out.view(self.historical_steps, out.shape[0] // self.historical_steps, -1)
@@ -139,7 +134,7 @@ class AAEncoder(MessagePassing):
     def forward(self,
                 x: torch.Tensor,
                 t: Optional[int],
-                edge_index: Adj,
+                edge_index: torch.Tensor,
                 edge_attr: torch.Tensor,
                 bos_mask: torch.Tensor,
                 rotate_mat: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -164,14 +159,13 @@ class AAEncoder(MessagePassing):
         return center_embed
 
     def message(self,
-                edge_index: Adj,
+                edge_index: torch.Tensor,
                 center_embed_i: torch.Tensor,
                 x_j: torch.Tensor,
                 edge_attr: torch.Tensor,
                 rotate_mat: Optional[torch.Tensor],
                 index: torch.Tensor,
-                ptr: OptTensor,
-                size_i: Optional[int]) -> torch.Tensor:
+                size_i: int) -> torch.Tensor:
         if rotate_mat is None:
             nbr_embed = self.nbr_embed([x_j, edge_attr])
         else:
@@ -186,7 +180,7 @@ class AAEncoder(MessagePassing):
         value = self.lin_v(nbr_embed).view(-1, self.num_heads, self.embed_dim // self.num_heads)
         scale = (self.embed_dim // self.num_heads) ** 0.5
         alpha = (query * key).sum(dim=-1) / scale
-        alpha = softmax(alpha, index, ptr, size_i)
+        alpha = softmax(alpha, index, size_i)
         alpha = self.attn_drop(alpha)
         return value * alpha.unsqueeze(-1)
 
@@ -197,27 +191,25 @@ class AAEncoder(MessagePassing):
         gate = torch.sigmoid(self.lin_ih(inputs) + self.lin_hh(center_embed))
         return inputs + gate * (self.lin_self(center_embed) - inputs)
 
-    def propagate(self, edge_index: Adj, x, center_embed, edge_attr, rotate_mat: Optional[torch.Tensor]):
+    def propagate(self, edge_index: torch.Tensor, x, center_embed, edge_attr, rotate_mat: Optional[torch.Tensor]):
         size: List[Optional[int]] = [None, None]
-        assert not is_sparse(edge_index)
 
         i, j = 1, 0
         center_embed_i = self._collect(center_embed, edge_index, size, i)
         x_j = self._collect(x, edge_index, size, j)
         
-        ptr = None
         index = edge_index[i]
         dim_size = size_i = size[i] if size[i] is not None else size[j]
 
-        out = self.message(edge_index, center_embed_i, x_j, edge_attr, rotate_mat, index, ptr, size_i)
-        out = self.aggregate(out, index, ptr, dim_size)
+        out = self.message(edge_index, center_embed_i, x_j, edge_attr, rotate_mat, index, size_i)
+        out = self.aggregate(out, index, dim_size)
         out = self.update(out, center_embed)
         return out
 
     def _mha_block(self,
                    center_embed: torch.Tensor,
                    x: torch.Tensor,
-                   edge_index: Adj,
+                   edge_index: torch.Tensor,
                    edge_attr: torch.Tensor,
                    rotate_mat: Optional[torch.Tensor]) -> torch.Tensor:
         center_embed = self.out_proj(self.propagate(edge_index=edge_index, x=x, center_embed=center_embed,
@@ -347,7 +339,7 @@ class ALEncoder(MessagePassing):
 
     def forward(self,
                 x: Tuple[torch.Tensor, torch.Tensor],
-                edge_index: Adj,
+                edge_index: torch.Tensor,
                 edge_attr: torch.Tensor,
                 is_intersections: torch.Tensor,
                 turn_directions: torch.Tensor,
@@ -363,7 +355,7 @@ class ALEncoder(MessagePassing):
         return x_actor
 
     def message(self,
-                edge_index: Adj,
+                edge_index: torch.Tensor,
                 x_i: torch.Tensor,
                 x_j: torch.Tensor,
                 edge_attr: torch.Tensor,
@@ -372,8 +364,7 @@ class ALEncoder(MessagePassing):
                 traffic_controls_j,
                 rotate_mat: Optional[torch.Tensor],
                 index: torch.Tensor,
-                ptr: OptTensor,
-                size_i: Optional[int]) -> torch.Tensor:
+                size_i: int) -> torch.Tensor:
         if rotate_mat is None:
             x_j = self.lane_embed([x_j, edge_attr],
                                   [self.is_intersection_embed[is_intersections_j],
@@ -391,7 +382,7 @@ class ALEncoder(MessagePassing):
         value = self.lin_v(x_j).view(-1, self.num_heads, self.embed_dim // self.num_heads)
         scale = (self.embed_dim // self.num_heads) ** 0.5
         alpha = (query * key).sum(dim=-1) / scale
-        alpha = softmax(alpha, index, ptr, size_i)
+        alpha = softmax(alpha, index, size_i)
         alpha = self.attn_drop(alpha)
         return value * alpha.unsqueeze(-1)
 
@@ -403,10 +394,9 @@ class ALEncoder(MessagePassing):
         gate = torch.sigmoid(self.lin_ih(inputs) + self.lin_hh(x_actor))
         return inputs + gate * (self.lin_self(x_actor) - inputs)
 
-    def propagate(self, edge_index: Adj, x: Tuple[torch.Tensor, torch.Tensor], edge_attr,
+    def propagate(self, edge_index: torch.Tensor, x: Tuple[torch.Tensor, torch.Tensor], edge_attr,
                   is_intersections, turn_directions, traffic_controls, rotate_mat: Optional[torch.Tensor]):
         size: List[Optional[int]] = [None, None]
-        assert not is_sparse(edge_index)
 
         i, j = 1, 0
         x_i = self._collect_tuple(x, edge_index, size, i)
@@ -415,19 +405,18 @@ class ALEncoder(MessagePassing):
         turn_directions_j = self._collect(turn_directions, edge_index, size, j)
         traffic_controls_j = self._collect(traffic_controls, edge_index, size, j)
         
-        ptr = None
         index = edge_index[i]
         dim_size = size_i = size[i] if size[i] is not None else size[j]
 
-        out = self.message(edge_index, x_i, x_j, edge_attr, is_intersections_j, turn_directions_j, traffic_controls_j, rotate_mat, index, ptr, size_i)
-        out = self.aggregate(out, index, ptr, dim_size)
+        out = self.message(edge_index, x_i, x_j, edge_attr, is_intersections_j, turn_directions_j, traffic_controls_j, rotate_mat, index, size_i)
+        out = self.aggregate(out, index, dim_size)
         out = self.update(out, x)
         return out
 
     def _mha_block(self,
                    x_actor: torch.Tensor,
                    x_lane: torch.Tensor,
-                   edge_index: Adj,
+                   edge_index: torch.Tensor,
                    edge_attr: torch.Tensor,
                    is_intersections: torch.Tensor,
                    turn_directions: torch.Tensor,

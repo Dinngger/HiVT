@@ -47,9 +47,6 @@ class TemporalData(Data):
                                            turn_directions=turn_directions, traffic_controls=traffic_controls,
                                            lane_actor_index=lane_actor_index, lane_actor_vectors=lane_actor_vectors,
                                            seq_id=seq_id, **kwargs)
-        if edge_attrs is not None:
-            for t in range(self.x.size(1)):
-                self[f'edge_attr_{t}'] = edge_attrs[t]
 
     def __inc__(self, key, value, *args, **kwargs):
         if key == 'lane_actor_index':
