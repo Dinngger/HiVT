@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
+from typing import List, Dict, Optional
 
 import torch
 import torch.nn as nn
 from mypyg.conv import MessagePassing
-from mypyg.typing import Adj, OptTensor, Size
+from mypyg.typing import Adj, OptTensor
 from mypyg.utils import softmax, subgraph, is_sparse
 
 from models import MultipleInputEmbedding
@@ -109,9 +109,8 @@ class GlobalInteractorLayer(MessagePassing):
     def forward(self,
                 x: torch.Tensor,
                 edge_index: Adj,
-                edge_attr: torch.Tensor,
-                size: Size = None) -> torch.Tensor:
-        x = x + self._mha_block(self.norm1(x), edge_index, edge_attr, size)
+                edge_attr: torch.Tensor) -> torch.Tensor:
+        x = x + self._mha_block(self.norm1(x), edge_index, edge_attr)
         x = x + self._ff_block(self.norm2(x))
         return x
 
@@ -140,11 +139,11 @@ class GlobalInteractorLayer(MessagePassing):
         gate = torch.sigmoid(self.lin_ih(inputs) + self.lin_hh(x))
         return inputs + gate * (self.lin_self(x) - inputs)
 
-    def propagate(self, edge_index, x, edge_attr, size):
-        size = self._check_input(edge_index, size)
+    def propagate(self, edge_index: Adj, x, edge_attr):
+        size: List[Optional[int]] = [None, None]
         assert not is_sparse(edge_index)
 
-        i, j = (1, 0)
+        i, j = 1, 0
         x_i = self._collect(x, edge_index, size, i)
         x_j = self._collect(x, edge_index, size, j)
         
@@ -160,9 +159,8 @@ class GlobalInteractorLayer(MessagePassing):
     def _mha_block(self,
                    x: torch.Tensor,
                    edge_index: Adj,
-                   edge_attr: torch.Tensor,
-                   size: Size) -> torch.Tensor:
-        x = self.out_proj(self.propagate(edge_index=edge_index, x=x, edge_attr=edge_attr, size=size))
+                   edge_attr: torch.Tensor) -> torch.Tensor:
+        x = self.out_proj(self.propagate(edge_index=edge_index, x=x, edge_attr=edge_attr))
         return self.proj_drop(x)
 
     def _ff_block(self, x: torch.Tensor) -> torch.Tensor:

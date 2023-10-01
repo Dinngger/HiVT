@@ -119,7 +119,7 @@ EdgeTensorType = Tuple[Tensor, Tensor]
 
 # Types for message passing ###################################################
 
-Adj = Union[Tensor, SparseTensor]
+Adj = Tensor
 OptTensor = Optional[Tensor]
 PairTensor = Tuple[Tensor, Tensor]
 OptPairTensor = Tuple[Tensor, Optional[Tensor]]

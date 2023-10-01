@@ -20,11 +20,9 @@ import numpy as np
 import pandas as pd
 import torch
 from argoverse.map_representation.map_api import ArgoverseMap
-from torch_geometric.data import Data
-from torch_geometric.data import Dataset
+from mypyg.data import Data
+from mypyg.data import Dataset
 from tqdm import tqdm
-
-from utils import TemporalData
 
 
 class ArgoverseV1Dataset(Dataset):
@@ -77,13 +75,13 @@ class ArgoverseV1Dataset(Dataset):
         am = ArgoverseMap()
         for raw_path in tqdm(self.raw_paths):
             kwargs = process_argoverse(self._split, raw_path, am, self._local_radius)
-            data = TemporalData(**kwargs)
-            torch.save(data, os.path.join(self.processed_dir, str(kwargs['seq_id']) + '.pt'))
+            # data = TemporalData(**kwargs)
+            torch.save(kwargs, os.path.join(self.processed_dir, str(kwargs['seq_id']) + '.pt'))
 
     def len(self) -> int:
         return len(self._raw_file_names)
 
-    def get(self, idx) -> Data:
+    def get(self, idx) -> Dict:
         return torch.load(self.processed_paths[idx])
 
 

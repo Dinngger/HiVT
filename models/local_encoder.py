@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.data import Batch
-from torch_geometric.data import Data
+from mypyg.data import Batch
+from mypyg.data import Data
 from mypyg.conv import MessagePassing
 from mypyg.typing import Adj
 from mypyg.typing import OptTensor
@@ -68,26 +68,26 @@ class LocalEncoder(nn.Module):
 
     def forward(self, data: TemporalData) -> torch.Tensor:
         for t in range(self.historical_steps):
-            data[f'edge_index_{t}'], _ = subgraph(subset=~data['padding_mask'][:, t], edge_index=data.edge_index)
+            data[f'edge_index_{t}'], _ = subgraph(subset=~data['padding_mask'][:, t], edge_index=data['edge_index'])
             data[f'edge_attr_{t}'] = \
                 data['positions'][data[f'edge_index_{t}'][0], t] - data['positions'][data[f'edge_index_{t}'][1], t]
-        if self.parallel:
-            snapshots = [None] * self.historical_steps
-            for t in range(self.historical_steps):
-                edge_index, edge_attr = self.drop_edge(data[f'edge_index_{t}'], data[f'edge_attr_{t}'])
-                snapshots[t] = Data(x=data.x[:, t], edge_index=edge_index, edge_attr=edge_attr,
-                                    num_nodes=data.num_nodes)
-            batch = Batch.from_data_list(snapshots)
-            out = self.aa_encoder(x=batch.x, t=None, edge_index=batch.edge_index, edge_attr=batch.edge_attr,
-                                  bos_mask=data['bos_mask'], rotate_mat=data['rotate_mat'])
-            out = out.view(self.historical_steps, out.shape[0] // self.historical_steps, -1)
-        else:
-            out = [None] * self.historical_steps
-            for t in range(self.historical_steps):
-                edge_index, edge_attr = self.drop_edge(data[f'edge_index_{t}'], data[f'edge_attr_{t}'])
-                out[t] = self.aa_encoder(x=data.x[:, t], t=t, edge_index=edge_index, edge_attr=edge_attr,
-                                         bos_mask=data['bos_mask'][:, t], rotate_mat=data['rotate_mat'])
-            out = torch.stack(out)  # [T, N, D]
+        # if self.parallel:
+        snapshots = [None] * self.historical_steps
+        for t in range(self.historical_steps):
+            edge_index, edge_attr = self.drop_edge(data[f'edge_index_{t}'], data[f'edge_attr_{t}'])
+            snapshots[t] = Data(x=data.x[:, t], edge_index=edge_index, edge_attr=edge_attr,
+                                num_nodes=data.num_nodes)
+        batch = Batch.from_data_list(snapshots)
+        out = self.aa_encoder(x=batch.x, t=None, edge_index=batch.edge_index, edge_attr=batch.edge_attr,
+                                bos_mask=data['bos_mask'], rotate_mat=data['rotate_mat'])
+        out = out.view(self.historical_steps, out.shape[0] // self.historical_steps, -1)
+        # else:
+        #     out = [None] * self.historical_steps
+        #     for t in range(self.historical_steps):
+        #         edge_index, edge_attr = self.drop_edge(data[f'edge_index_{t}'], data[f'edge_attr_{t}'])
+        #         out[t] = self.aa_encoder(x=data.x[:, t], t=t, edge_index=edge_index, edge_attr=edge_attr,
+        #                                  bos_mask=data['bos_mask'][:, t], rotate_mat=data['rotate_mat'])
+        #     out = torch.stack(out)  # [T, N, D]
         out = self.temporal_encoder(x=out, padding_mask=data['padding_mask'][:, : self.historical_steps])
         edge_index, edge_attr = self.drop_edge(data['lane_actor_index'], data['lane_actor_vectors'])
         out = self.al_encoder(x=(data['lane_vectors'], out), edge_index=edge_index, edge_attr=edge_attr,
@@ -142,26 +142,24 @@ class AAEncoder(MessagePassing):
                 edge_index: Adj,
                 edge_attr: torch.Tensor,
                 bos_mask: torch.Tensor,
-                rotate_mat: Optional[torch.Tensor] = None,
-                size: Size = None) -> torch.Tensor:
-        if self.parallel:
-            if rotate_mat is None:
-                center_embed = self.center_embed(x.view(self.historical_steps, x.shape[0] // self.historical_steps, -1))
-            else:
-                center_embed = self.center_embed(
-                    torch.matmul(x.view(self.historical_steps, x.shape[0] // self.historical_steps, -1).unsqueeze(-2),
-                                 rotate_mat.expand(self.historical_steps, *rotate_mat.shape)).squeeze(-2))
-            center_embed = torch.where(bos_mask.t().unsqueeze(-1),
-                                       self.bos_token.unsqueeze(-2),
-                                       center_embed).reshape(x.shape[0], -1)
+                rotate_mat: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # if self.parallel:
+        if rotate_mat is None:
+            center_embed = self.center_embed(x.view(self.historical_steps, x.shape[0] // self.historical_steps, -1))
         else:
-            if rotate_mat is None:
-                center_embed = self.center_embed(x)
-            else:
-                center_embed = self.center_embed(torch.bmm(x.unsqueeze(-2), rotate_mat).squeeze(-2))
-            center_embed = torch.where(bos_mask.unsqueeze(-1), self.bos_token[t], center_embed)
-        center_embed = center_embed + self._mha_block(self.norm1(center_embed), x, edge_index, edge_attr, rotate_mat,
-                                                      size)
+            center_embed = self.center_embed(
+                torch.matmul(x.view(self.historical_steps, x.shape[0] // self.historical_steps, -1).unsqueeze(-2),
+                                rotate_mat.expand(self.historical_steps, rotate_mat.shape[0], 2, 2)).squeeze(-2))
+        center_embed = torch.where(bos_mask.t().unsqueeze(-1),
+                                    self.bos_token.unsqueeze(-2),
+                                    center_embed).reshape(x.shape[0], -1)
+        # else:
+        #     if rotate_mat is None:
+        #         center_embed = self.center_embed(x)
+        #     else:
+        #         center_embed = self.center_embed(torch.bmm(x.unsqueeze(-2), rotate_mat).squeeze(-2))
+        #     center_embed = torch.where(bos_mask.unsqueeze(-1), self.bos_token[t], center_embed)
+        center_embed = center_embed + self._mha_block(self.norm1(center_embed), x, edge_index, edge_attr, rotate_mat)
         center_embed = center_embed + self._ff_block(self.norm2(center_embed))
         return center_embed
 
@@ -177,10 +175,10 @@ class AAEncoder(MessagePassing):
         if rotate_mat is None:
             nbr_embed = self.nbr_embed([x_j, edge_attr])
         else:
-            if self.parallel:
-                center_rotate_mat = rotate_mat.repeat(self.historical_steps, 1, 1)[edge_index[1]]
-            else:
-                center_rotate_mat = rotate_mat[edge_index[1]]
+            # if self.parallel:
+            center_rotate_mat = rotate_mat.repeat(self.historical_steps, 1, 1)[edge_index[1]]
+            # else:
+            #     center_rotate_mat = rotate_mat[edge_index[1]]
             nbr_embed = self.nbr_embed([torch.bmm(x_j.unsqueeze(-2), center_rotate_mat).squeeze(-2),
                                         torch.bmm(edge_attr.unsqueeze(-2), center_rotate_mat).squeeze(-2)])
         query = self.lin_q(center_embed_i).view(-1, self.num_heads, self.embed_dim // self.num_heads)
@@ -199,11 +197,11 @@ class AAEncoder(MessagePassing):
         gate = torch.sigmoid(self.lin_ih(inputs) + self.lin_hh(center_embed))
         return inputs + gate * (self.lin_self(center_embed) - inputs)
 
-    def propagate(self, edge_index, x, center_embed, edge_attr, rotate_mat, size):
-        size = self._check_input(edge_index, size)
+    def propagate(self, edge_index: Adj, x, center_embed, edge_attr, rotate_mat: Optional[torch.Tensor]):
+        size: List[Optional[int]] = [None, None]
         assert not is_sparse(edge_index)
 
-        i, j = (1, 0)
+        i, j = 1, 0
         center_embed_i = self._collect(center_embed, edge_index, size, i)
         x_j = self._collect(x, edge_index, size, j)
         
@@ -221,10 +219,9 @@ class AAEncoder(MessagePassing):
                    x: torch.Tensor,
                    edge_index: Adj,
                    edge_attr: torch.Tensor,
-                   rotate_mat: Optional[torch.Tensor],
-                   size: Size) -> torch.Tensor:
+                   rotate_mat: Optional[torch.Tensor]) -> torch.Tensor:
         center_embed = self.out_proj(self.propagate(edge_index=edge_index, x=x, center_embed=center_embed,
-                                                    edge_attr=edge_attr, rotate_mat=rotate_mat, size=size))
+                                                    edge_attr=edge_attr, rotate_mat=rotate_mat))
         return self.proj_drop(center_embed)
 
     def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
@@ -241,6 +238,7 @@ class TemporalEncoder(nn.Module):
                  dropout: float = 0.1) -> None:
         super(TemporalEncoder, self).__init__()
         encoder_layer = TemporalEncoderLayer(embed_dim=embed_dim, num_heads=num_heads, dropout=dropout)
+        # see https://github.com/pytorch/pytorch/pull/102045
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=num_layers,
                                                          norm=nn.LayerNorm(embed_dim))
         self.padding_token = nn.Parameter(torch.Tensor(historical_steps, 1, embed_dim))
@@ -276,7 +274,7 @@ class TemporalEncoderLayer(nn.Module):
                  embed_dim: int,
                  num_heads: int = 8,
                  dropout: float = 0.1) -> None:
-        super(TemporalEncoderLayer, self).__init__()
+        super().__init__()
         self.self_attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, dropout=dropout)
         self.linear1 = nn.Linear(embed_dim, embed_dim * 4)
         self.dropout = nn.Dropout(dropout)
@@ -354,14 +352,13 @@ class ALEncoder(MessagePassing):
                 is_intersections: torch.Tensor,
                 turn_directions: torch.Tensor,
                 traffic_controls: torch.Tensor,
-                rotate_mat: Optional[torch.Tensor] = None,
-                size: Size = None) -> torch.Tensor:
+                rotate_mat: Optional[torch.Tensor] = None) -> torch.Tensor:
         x_lane, x_actor = x
         is_intersections = is_intersections.long()
         turn_directions = turn_directions.long()
         traffic_controls = traffic_controls.long()
         x_actor = x_actor + self._mha_block(self.norm1(x_actor), x_lane, edge_index, edge_attr, is_intersections,
-                                            turn_directions, traffic_controls, rotate_mat, size)
+                                            turn_directions, traffic_controls, rotate_mat)
         x_actor = x_actor + self._ff_block(self.norm2(x_actor))
         return x_actor
 
@@ -400,19 +397,20 @@ class ALEncoder(MessagePassing):
 
     def update(self,
                inputs: torch.Tensor,
-               x: torch.Tensor) -> torch.Tensor:
+               x: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         x_actor = x[1]
         inputs = inputs.view(-1, self.embed_dim)
         gate = torch.sigmoid(self.lin_ih(inputs) + self.lin_hh(x_actor))
         return inputs + gate * (self.lin_self(x_actor) - inputs)
 
-    def propagate(self, edge_index, x, edge_attr, is_intersections, turn_directions, traffic_controls, rotate_mat, size):
-        size = self._check_input(edge_index, size)
+    def propagate(self, edge_index: Adj, x: Tuple[torch.Tensor, torch.Tensor], edge_attr,
+                  is_intersections, turn_directions, traffic_controls, rotate_mat: Optional[torch.Tensor]):
+        size: List[Optional[int]] = [None, None]
         assert not is_sparse(edge_index)
 
-        i, j = (1, 0)
-        x_i = self._collect(x, edge_index, size, i)
-        x_j = self._collect(x, edge_index, size, j)
+        i, j = 1, 0
+        x_i = self._collect_tuple(x, edge_index, size, i)
+        x_j = self._collect_tuple(x, edge_index, size, j)
         is_intersections_j = self._collect(is_intersections, edge_index, size, j)
         turn_directions_j = self._collect(turn_directions, edge_index, size, j)
         traffic_controls_j = self._collect(traffic_controls, edge_index, size, j)
@@ -434,11 +432,10 @@ class ALEncoder(MessagePassing):
                    is_intersections: torch.Tensor,
                    turn_directions: torch.Tensor,
                    traffic_controls: torch.Tensor,
-                   rotate_mat: Optional[torch.Tensor],
-                   size: Size) -> torch.Tensor:
+                   rotate_mat: Optional[torch.Tensor]) -> torch.Tensor:
         x_actor = self.out_proj(self.propagate(edge_index=edge_index, x=(x_lane, x_actor), edge_attr=edge_attr,
                                                is_intersections=is_intersections, turn_directions=turn_directions,
-                                               traffic_controls=traffic_controls, rotate_mat=rotate_mat, size=size))
+                                               traffic_controls=traffic_controls, rotate_mat=rotate_mat))
         return self.proj_drop(x_actor)
 
     def _ff_block(self, x_actor: torch.Tensor) -> torch.Tensor:

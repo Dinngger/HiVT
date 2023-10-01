@@ -4,7 +4,7 @@ from typing import List, Any, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
-from mypyg.typing import OptTensor, WITH_TORCH_SCATTER, torch_scatter, SparseTensor
+from mypyg.typing import OptTensor, SparseTensor
 
 
 def is_torch_sparse_tensor(src: Any) -> bool:
@@ -24,15 +24,14 @@ def is_torch_sparse_tensor(src: Any) -> bool:
     return False
 
 
-def maybe_num_nodes(edge_index, num_nodes=None):
+def maybe_num_nodes(edge_index: Tensor, num_nodes: Optional[int] = None):
     if num_nodes is not None:
         return num_nodes
-    elif isinstance(edge_index, Tensor):
-        if is_torch_sparse_tensor(edge_index):
-            return max(edge_index.size(0), edge_index.size(1))
-        return int(edge_index.max()) + 1 if edge_index.numel() > 0 else 0
     else:
-        return max(edge_index.size(0), edge_index.size(1))
+        # isinstance(edge_index, Tensor)
+        # if is_torch_sparse_tensor(edge_index):
+        #     return max(edge_index.size(0), edge_index.size(1))
+        return int(edge_index.max()) + 1 if edge_index.numel() > 0 else 0
 
 
 def index_to_mask(index: Tensor, size: Optional[int] = None) -> Tensor:
@@ -204,38 +203,26 @@ def scatter(src: Tensor, index: Tensor, dim: int = 0,
     # For "min" and "max" reduction, we prefer `scatter_reduce_` on CPU or
     # in case the input does not require gradients:
     if reduce == 'min' or reduce == 'max':
-        if (not WITH_TORCH_SCATTER
-                or not src.is_cuda or not src.requires_grad):
+        if src.is_cuda and src.requires_grad:
+            warnings.warn(f"The usage of `scatter(reduce='{reduce}')` "
+                            f"can be accelerated via the 'torch-scatter'"
+                            f" package, but it was not found")
 
-            if src.is_cuda and src.requires_grad:
-                warnings.warn(f"The usage of `scatter(reduce='{reduce}')` "
-                                f"can be accelerated via the 'torch-scatter'"
-                                f" package, but it was not found")
-
-            index = broadcast(index, src, dim)
-            return src.new_zeros(size).scatter_reduce_(
-                dim, index, src, reduce=f'a{reduce}', include_self=False)
-
-        return torch_scatter.scatter(src, index, dim, dim_size=dim_size,
-                                        reduce=reduce)
+        index = broadcast(index, src, dim)
+        return src.new_zeros(size).scatter_reduce_(
+            dim, index, src, reduce=f'a{reduce}', include_self=False)
 
     # For "mul" reduction, we prefer `scatter_reduce_` on CPU:
     if reduce == 'mul':
-        if (not WITH_TORCH_SCATTER
-                or not src.is_cuda):
+        if src.is_cuda:
+            warnings.warn(f"The usage of `scatter(reduce='{reduce}')` "
+                            f"can be accelerated via the 'torch-scatter'"
+                            f" package, but it was not found")
 
-            if src.is_cuda:
-                warnings.warn(f"The usage of `scatter(reduce='{reduce}')` "
-                                f"can be accelerated via the 'torch-scatter'"
-                                f" package, but it was not found")
-
-            index = broadcast(index, src, dim)
-            # We initialize with `one` here to match `scatter_mul` output:
-            return src.new_ones(size).scatter_reduce_(
-                dim, index, src, reduce='prod', include_self=True)
-
-        return torch_scatter.scatter(src, index, dim, dim_size=dim_size,
-                                        reduce='mul')
+        index = broadcast(index, src, dim)
+        # We initialize with `one` here to match `scatter_mul` output:
+        return src.new_ones(size).scatter_reduce_(
+            dim, index, src, reduce='prod', include_self=True)
 
     raise ValueError(f"Encountered invalid `reduce` argument '{reduce}'")
 

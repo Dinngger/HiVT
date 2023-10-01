@@ -15,7 +15,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch_geometric.data import Data
+from mypyg.data import Data
 
 
 class TemporalData(Data):

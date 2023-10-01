@@ -1,6 +1,7 @@
 from inspect import Parameter
 from typing import (
     Any,
+    Tuple,
     List,
     Set,
     Optional,
@@ -165,36 +166,6 @@ class MessagePassing(torch.nn.Module):
         r"""Runs the forward pass of the module."""
         pass
 
-    def _check_input(self, edge_index, size):
-        the_size: List[Optional[int]] = [None, None]
-
-        if is_sparse(edge_index):
-            the_size[0] = edge_index.size(1)
-            the_size[1] = edge_index.size(0)
-            return the_size
-        elif isinstance(edge_index, Tensor):
-            int_dtypes = (torch.uint8, torch.int8, torch.int32, torch.int64)
-
-            if edge_index.dtype not in int_dtypes:
-                raise ValueError(f"Expected 'edge_index' to be of integer "
-                                 f"type (got '{edge_index.dtype}')")
-            if edge_index.dim() != 2:
-                raise ValueError(f"Expected 'edge_index' to be two-dimensional"
-                                 f" (got {edge_index.dim()} dimensions)")
-            if edge_index.size(0) != 2:
-                raise ValueError(f"Expected 'edge_index' to have size '2' in "
-                                 f"the first dimension (got "
-                                 f"'{edge_index.size(0)}')")
-            if size is not None:
-                the_size[0] = size[0]
-                the_size[1] = size[1]
-            return the_size
-
-        raise ValueError(
-            ('`MessagePassing.propagate` only supports integer tensors of '
-             'shape `[2, num_messages]`, `torch_sparse.SparseTensor` or '
-             '`torch.sparse.Tensor` for argument `edge_index`.'))
-
     def _set_size(self, size: List[Optional[int]], dim: int, src: Tensor):
         the_size = size[dim]
         if the_size is None:
@@ -204,7 +175,7 @@ class MessagePassing(torch.nn.Module):
                 (f'Encountered tensor with size {src.size(self.node_dim)} in '
                  f'dimension {self.node_dim}, but expected size {the_size}.'))
 
-    def _lift(self, src, edge_index, dim):
+    def _lift(self, src, edge_index, dim: int):
         if is_torch_sparse_tensor(edge_index):
             assert dim == 0 or dim == 1
             if edge_index.layout == torch.sparse_coo:
@@ -225,39 +196,8 @@ class MessagePassing(torch.nn.Module):
             return src.index_select(self.node_dim, index)
 
         elif isinstance(edge_index, Tensor):
-            try:
-                index = edge_index[dim]
-                return src.index_select(self.node_dim, index)
-            except (IndexError, RuntimeError) as e:
-                if index.min() < 0 or index.max() >= src.size(self.node_dim):
-                    raise IndexError(
-                        f"Encountered an index error. Please ensure that all "
-                        f"indices in 'edge_index' point to valid indices in "
-                        f"the interval [0, {src.size(self.node_dim) - 1}] "
-                        f"(got interval "
-                        f"[{int(index.min())}, {int(index.max())}])")
-                else:
-                    raise e
-
-                if index.numel() > 0 and index.min() < 0:
-                    raise ValueError(
-                        f"Found negative indices in 'edge_index' (got "
-                        f"{index.min().item()}). Please ensure that all "
-                        f"indices in 'edge_index' point to valid indices "
-                        f"in the interval [0, {src.size(self.node_dim)}) in "
-                        f"your node feature matrix and try again.")
-
-                if (index.numel() > 0
-                        and index.max() >= src.size(self.node_dim)):
-                    raise ValueError(
-                        f"Found indices in 'edge_index' that are larger "
-                        f"than {src.size(self.node_dim) - 1} (got "
-                        f"{index.max().item()}). Please ensure that all "
-                        f"indices in 'edge_index' point to valid indices "
-                        f"in the interval [0, {src.size(self.node_dim)}) in "
-                        f"your node feature matrix and try again.")
-
-                raise e
+            index = edge_index[dim]
+            return src.index_select(self.node_dim, index)
 
         elif isinstance(edge_index, SparseTensor):
             if dim == 0:
@@ -272,13 +212,14 @@ class MessagePassing(torch.nn.Module):
              'shape `[2, num_messages]`, `torch_sparse.SparseTensor` '
              'or `torch.sparse.Tensor` for argument `edge_index`.'))
 
-    def _collect(self, data, edge_index, size, dim):
-        if isinstance(data, (tuple, list)):
-            assert len(data) == 2
-            if isinstance(data[1 - dim], Tensor):
-                self._set_size(size, 1 - dim, data[1 - dim])
-            data = data[dim]
+    def _collect_tuple(self, data: Tuple[Tensor, Tensor], edge_index, size: List[Optional[int]], dim: int):
+        assert len(data) == 2
+        if isinstance(data[1 - dim], Tensor):
+            self._set_size(size, 1 - dim, data[1 - dim])
+        data = data[dim]
+        return self._collect(data, edge_index, size, dim)
 
+    def _collect(self, data: Tensor, edge_index, size: List[Optional[int]], dim: int):
         if isinstance(data, Tensor):
             self._set_size(size, dim, data)
             data = self._lift(data, edge_index, dim)
