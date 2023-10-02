@@ -54,7 +54,7 @@ class GlobalInteractor(nn.Module):
     def forward(self,
                 data: Data,
                 local_embed: torch.Tensor) -> torch.Tensor:
-        edge_index, _ = subgraph(subset=~data['padding_mask'][:, self.historical_steps - 1], edge_index=data.edge_index)
+        edge_index, _ = subgraph(subset=~data['padding_mask'][:, self.historical_steps - 1], edge_index=data['edge_index'])
         rel_pos = data['positions'][edge_index[0], self.historical_steps - 1] - data['positions'][
             edge_index[1], self.historical_steps - 1]
         if data['rotate_mat'] is None:
@@ -138,14 +138,14 @@ class GlobalInteractorLayer(MessagePassing):
         return inputs + gate * (self.lin_self(x) - inputs)
 
     def propagate(self, edge_index: torch.Tensor, x, edge_attr):
-        size: List[Optional[int]] = [None, None]
+        size: List[int] = [-1, -1]
 
         i, j = 1, 0
         x_i = self._collect(x, edge_index, size, i)
         x_j = self._collect(x, edge_index, size, j)
         
         index = edge_index[i]
-        dim_size = size_i = size[i] if size[i] is not None else size[j]
+        dim_size = size_i = size[i] if size[i] >= 0 else size[j]
 
         out = self.message(x_i, x_j, edge_attr, index, size_i)
         out = self.aggregate(out, index, dim_size)

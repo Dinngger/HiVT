@@ -18,58 +18,20 @@ import torch.nn as nn
 from mypyg.data import Data
 
 
-class TemporalData(Data):
-
-    def __init__(self,
-                 x: Optional[torch.Tensor] = None,
-                 positions: Optional[torch.Tensor] = None,
-                 edge_index: Optional[torch.Tensor] = None,
-                 edge_attrs: Optional[List[torch.Tensor]] = None,
-                 y: Optional[torch.Tensor] = None,
-                 num_nodes: Optional[int] = None,
-                 padding_mask: Optional[torch.Tensor] = None,
-                 bos_mask: Optional[torch.Tensor] = None,
-                 rotate_angles: Optional[torch.Tensor] = None,
-                 lane_vectors: Optional[torch.Tensor] = None,
-                 is_intersections: Optional[torch.Tensor] = None,
-                 turn_directions: Optional[torch.Tensor] = None,
-                 traffic_controls: Optional[torch.Tensor] = None,
-                 lane_actor_index: Optional[torch.Tensor] = None,
-                 lane_actor_vectors: Optional[torch.Tensor] = None,
-                 seq_id: Optional[int] = None,
-                 **kwargs) -> None:
-        if x is None:
-            super(TemporalData, self).__init__()
-            return
-        super(TemporalData, self).__init__(x=x, positions=positions, edge_index=edge_index, y=y, num_nodes=num_nodes,
-                                           padding_mask=padding_mask, bos_mask=bos_mask, rotate_angles=rotate_angles,
-                                           lane_vectors=lane_vectors, is_intersections=is_intersections,
-                                           turn_directions=turn_directions, traffic_controls=traffic_controls,
-                                           lane_actor_index=lane_actor_index, lane_actor_vectors=lane_actor_vectors,
-                                           seq_id=seq_id, **kwargs)
-
-    def __inc__(self, key, value, *args, **kwargs):
-        if key == 'lane_actor_index':
-            return torch.tensor([[self['lane_vectors'].size(0)], [self.num_nodes]])
-        else:
-            return super().__inc__(key, value)
+def create_data(num_nodes: Optional[int] = None, **kwargs) -> Data:
+    kwargs['agent_index'] = torch.IntTensor([kwargs['agent_index']])
+    kwargs = {k: v for k, v in kwargs.items() if torch.is_tensor(v)}
+    data = Data(num_nodes=num_nodes, kwargs=kwargs)
+    return data
 
 
-class DistanceDropEdge(object):
-
-    def __init__(self, max_distance: Optional[float] = None) -> None:
-        self.max_distance = max_distance
-
-    def __call__(self,
-                 edge_index: torch.Tensor,
-                 edge_attr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.max_distance is None:
-            return edge_index, edge_attr
-        row, col = edge_index
-        mask = torch.norm(edge_attr, p=2, dim=-1) < self.max_distance
-        edge_index = torch.stack([row[mask], col[mask]], dim=0)
-        edge_attr = edge_attr[mask]
-        return edge_index, edge_attr
+def distance_drop_edge(max_distance: float, edge_index: torch.Tensor,
+                       edge_attr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    row, col = edge_index[0], edge_index[1]
+    mask = torch.norm(edge_attr, p=2, dim=-1) < max_distance
+    edge_index = torch.stack([row[mask], col[mask]], dim=0)
+    edge_attr = edge_attr[mask]
+    return edge_index, edge_attr
 
 
 def init_weights(m: nn.Module) -> None:

@@ -89,15 +89,18 @@ class HiVT(pl.LightningModule):
 
     def forward(self, data: Data):
         if self.rotate:
-            rotate_mat = torch.empty(data.num_nodes, 2, 2, device=self.device)
-            sin_vals = torch.sin(data['rotate_angles'])
-            cos_vals = torch.cos(data['rotate_angles'])
+            rotate_angles = data['rotate_angles']
+            num_nodes = data.num_nodes
+            assert num_nodes is not None
+            rotate_mat = torch.empty(num_nodes, 2, 2, device=rotate_angles.device)
+            sin_vals = torch.sin(rotate_angles)
+            cos_vals = torch.cos(rotate_angles)
             rotate_mat[:, 0, 0] = cos_vals
             rotate_mat[:, 0, 1] = -sin_vals
             rotate_mat[:, 1, 0] = sin_vals
             rotate_mat[:, 1, 1] = cos_vals
-            if data.y is not None:
-                data.y = torch.bmm(data.y, rotate_mat)
+            if 'y' in data.keys:
+                data['y'] = torch.bmm(data['y'], rotate_mat)
             data['rotate_mat'] = rotate_mat
         else:
             data['rotate_mat'] = None
@@ -112,10 +115,10 @@ class HiVT(pl.LightningModule):
         reg_mask = ~data['padding_mask'][:, self.historical_steps:]
         valid_steps = reg_mask.sum(dim=-1)
         cls_mask = valid_steps > 0
-        l2_norm = (torch.norm(y_hat[:, :, :, : 2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)  # [F, N]
+        l2_norm = (torch.norm(y_hat[:, :, :, : 2] - data['y'], p=2, dim=-1) * reg_mask).sum(dim=-1)  # [F, N]
         best_mode = l2_norm.argmin(dim=0)
         y_hat_best = y_hat[best_mode, torch.arange(data.num_nodes)]
-        reg_loss = self.reg_loss(y_hat_best[reg_mask], data.y[reg_mask])
+        reg_loss = self.reg_loss(y_hat_best[reg_mask], data['y'][reg_mask])
         soft_target = F.softmax(-l2_norm[:, cls_mask] / valid_steps[cls_mask], dim=0).t().detach()
         cls_loss = self.cls_loss(pi[cls_mask], soft_target)
         loss = reg_loss + cls_loss
@@ -125,17 +128,17 @@ class HiVT(pl.LightningModule):
     def validation_step(self, data, batch_idx):
         y_hat, pi = self(data)
         reg_mask = ~data['padding_mask'][:, self.historical_steps:]
-        l2_norm = (torch.norm(y_hat[:, :, :, : 2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)  # [F, N]
+        l2_norm = (torch.norm(y_hat[:, :, :, : 2] - data['y'], p=2, dim=-1) * reg_mask).sum(dim=-1)  # [F, N]
         best_mode = l2_norm.argmin(dim=0)
         y_hat_best = y_hat[best_mode, torch.arange(data.num_nodes)]
-        reg_loss = self.reg_loss(y_hat_best[reg_mask], data.y[reg_mask])
+        reg_loss = self.reg_loss(y_hat_best[reg_mask], data['y'][reg_mask])
         self.log('val_reg_loss', reg_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
 
         y_hat_agent = y_hat[:, data['agent_index'], :, : 2]
-        y_agent = data.y[data['agent_index']]
+        y_agent = data['y'][data['agent_index']]
         fde_agent = torch.norm(y_hat_agent[:, :, -1] - y_agent[:, -1], p=2, dim=-1)
         best_mode_agent = fde_agent.argmin(dim=0)
-        y_hat_best_agent = y_hat_agent[best_mode_agent, torch.arange(data.num_graphs)]
+        y_hat_best_agent = y_hat_agent[best_mode_agent, torch.arange(data.__num_graphs__)]
         self.minADE.update(y_hat_best_agent, y_agent)
         self.minFDE.update(y_hat_best_agent, y_agent)
         self.minMR.update(y_hat_best_agent, y_agent)

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from argparse import ArgumentParser
-
+import torch
 import pytorch_lightning as pl
 from mypyg.data import DataLoader
 
@@ -34,7 +34,11 @@ if __name__ == '__main__':
 
     trainer = pl.Trainer()
     model = HiVT.load_from_checkpoint(checkpoint_path=args.ckpt_path, parallel=True)
+
     val_dataset = ArgoverseV1Dataset(root=args.root, split='val', local_radius=model.hparams.local_radius)
     dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
                             pin_memory=args.pin_memory, persistent_workers=args.persistent_workers)
     trainer.validate(model, dataloader)
+
+    script = model.to_torchscript()
+    torch.jit.save(script, "model.pt")

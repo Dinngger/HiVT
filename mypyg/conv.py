@@ -117,9 +117,9 @@ class MessagePassing(torch.nn.Module):
         r"""Runs the forward pass of the module."""
         pass
 
-    def _set_size(self, size: List[Optional[int]], dim: int, src: Tensor):
+    def _set_size(self, size: List[int], dim: int, src: Tensor):
         the_size = size[dim]
-        if the_size is None:
+        if the_size < 0:
             size[dim] = src.size(self.node_dim)
         elif the_size != src.size(self.node_dim):
             raise ValueError(
@@ -130,14 +130,14 @@ class MessagePassing(torch.nn.Module):
         index = edge_index[dim]
         return src.index_select(self.node_dim, index)
 
-    def _collect_tuple(self, data: Tuple[Tensor, Tensor], edge_index, size: List[Optional[int]], dim: int):
+    def _collect_tuple(self, data: Tuple[Tensor, Tensor], edge_index, size: List[int], dim: int):
         assert len(data) == 2
         if isinstance(data[1 - dim], Tensor):
             self._set_size(size, 1 - dim, data[1 - dim])
         data = data[dim]
         return self._collect(data, edge_index, size, dim)
 
-    def _collect(self, data: Tensor, edge_index, size: List[Optional[int]], dim: int):
+    def _collect(self, data: Tensor, edge_index, size: List[int], dim: int):
         if isinstance(data, Tensor):
             self._set_size(size, dim, data)
             data = self._lift(data, edge_index, dim)
