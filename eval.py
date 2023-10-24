@@ -32,7 +32,7 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt_path', type=str, required=True)
     args = parser.parse_args()
 
-    trainer = pl.Trainer()
+    trainer = pl.Trainer(logger=False)
     model = HiVT.load_from_checkpoint(checkpoint_path=args.ckpt_path, parallel=True)
 
     val_dataset = ArgoverseV1Dataset(root=args.root, split='val', local_radius=model.hparams.local_radius)
@@ -40,5 +40,5 @@ if __name__ == '__main__':
                             pin_memory=args.pin_memory, persistent_workers=args.persistent_workers)
     trainer.validate(model, dataloader)
 
-    script = model.to_torchscript()
-    torch.jit.save(script, "model.pt")
+    # script = model.to_torchscript()
+    # torch.jit.save(script, "model.pt")

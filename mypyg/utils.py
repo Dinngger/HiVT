@@ -1,5 +1,6 @@
 from typing import Tuple, Optional
 from torch import Tensor
+from torch.utils.cpp_extension import load
 
 
 def subgraph(
@@ -43,6 +44,8 @@ def scatter(src: Tensor, index: Tensor, dim: int,
     raise ValueError(f"Encountered invalid `reduce` argument '{reduce}'")
 
 
+gat_cu = load(name="gat", sources=["ops/gat.cu"])
+
 def softmax(
     src: Tensor,
     index: Tensor,
@@ -50,7 +53,8 @@ def softmax(
     dim: int = 0,
 ) -> Tensor:
     N = num_nodes
-    src_max = scatter(src.detach(), index, dim, dim_size=N, reduce='max')
+    src_max = gat_cu.scatter_max(src.detach(), index, dim, N)
+    # src_max = scatter(src.detach(), index, dim, dim_size=N, reduce='max')
     out = src - src_max.index_select(dim, index)
     out = out.exp()
     out_sum = scatter(out, index, dim, dim_size=N, reduce='sum') + 1e-16
