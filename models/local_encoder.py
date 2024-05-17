@@ -23,6 +23,7 @@ from mypyg.utils import softmax, subgraph
 from models import MultipleInputEmbedding
 from models import SingleInputEmbedding
 from utils import distance_drop_edge, init_weights
+from ops.gat import gat, gat2, count_index
 
 
 class LocalEncoder(nn.Module):
@@ -63,7 +64,7 @@ class LocalEncoder(nn.Module):
         for t in range(self.historical_steps):
             data[f'edge_index_{t}'], _ = subgraph(subset=~data['padding_mask'][:, t], edge_index=data['edge_index'])
             data[f'edge_attr_{t}'] = \
-                data['positions'][data[f'edge_index_{t}'][0], t] - data['positions'][data[f'edge_index_{t}'][1], t]
+                data['positions'][data[f'edge_index_{t}'][1], t] - data['positions'][data[f'edge_index_{t}'][0], t]
         # if self.parallel:
         snapshots: List[Data] = []
         for t in range(self.historical_steps):
@@ -88,7 +89,7 @@ class LocalEncoder(nn.Module):
         return out
 
 
-class AAEncoder(MessagePassing):
+class AAEncoder(torch.nn.Module):
 
     def __init__(self,
                  historical_steps: int,
@@ -97,9 +98,10 @@ class AAEncoder(MessagePassing):
                  embed_dim: int,
                  num_heads: int = 8,
                  dropout: float = 0.1,
-                 parallel: bool = False,
-                 **kwargs) -> None:
-        super(AAEncoder, self).__init__(aggr='add', node_dim=0, **kwargs)
+                 parallel: bool = False) -> None:
+        super(AAEncoder, self).__init__()
+        self.node_dim = 0
+
         self.historical_steps = historical_steps
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -127,51 +129,48 @@ class AAEncoder(MessagePassing):
         self.bos_token = nn.Parameter(torch.Tensor(historical_steps, embed_dim))
         nn.init.normal_(self.bos_token, mean=0., std=.02)
         self.apply(init_weights)
-
+    
     def forward(self,
                 x: torch.Tensor,
                 t: Optional[int],
                 edge_index: torch.Tensor,
                 edge_attr: torch.Tensor,
                 bos_mask: torch.Tensor,
-                rotate_mat: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # if self.parallel:
-        if rotate_mat is None:
-            center_embed = self.center_embed(x.view(self.historical_steps, x.shape[0] // self.historical_steps, -1))
-        else:
-            center_embed = self.center_embed(
-                torch.matmul(x.view(self.historical_steps, x.shape[0] // self.historical_steps, -1).unsqueeze(-2),
-                                rotate_mat.expand(self.historical_steps, rotate_mat.shape[0], 2, 2)).squeeze(-2))
-        center_embed = torch.where(bos_mask.t().unsqueeze(-1),
-                                    self.bos_token.unsqueeze(-2),
-                                    center_embed).reshape(x.shape[0], -1)
-        # else:
-        #     if rotate_mat is None:
-        #         center_embed = self.center_embed(x)
-        #     else:
-        #         center_embed = self.center_embed(torch.bmm(x.unsqueeze(-2), rotate_mat).squeeze(-2))
-        #     center_embed = torch.where(bos_mask.unsqueeze(-1), self.bos_token[t], center_embed)
-        center_embed = center_embed + self._mha_block(self.norm1(center_embed), x, edge_index, edge_attr, rotate_mat)
-        center_embed = center_embed + self._ff_block(self.norm2(center_embed))
-        return center_embed
+                rotate_mat: torch.Tensor) -> torch.Tensor:
+        center_embed = \
+            torch.matmul(x.view(self.historical_steps, x.shape[0] // self.historical_steps, -1).unsqueeze(-2),
+                         rotate_mat.expand(self.historical_steps, rotate_mat.shape[0], 2, 2)).squeeze(-2)
+        center_embed1 = torch.zeros(center_embed.shape[0], center_embed.shape[1], 64, device=center_embed.device)
+        gat(center_embed, center_embed1,
+            self.center_embed.embed[0].weight, self.center_embed.embed[0].bias,
+            self.center_embed.embed[1].weight, self.center_embed.embed[1].bias,
+            self.center_embed.embed[3].weight, self.center_embed.embed[3].bias,
+            self.center_embed.embed[4].weight, self.center_embed.embed[4].bias,
+            self.center_embed.embed[6].weight, self.center_embed.embed[6].bias,
+            self.center_embed.embed[7].weight, self.center_embed.embed[7].bias,
+            bos_mask, self.bos_token)
+        center_embed1 = center_embed1.reshape(x.shape[0], -1)
 
-    def message(self,
-                edge_index: torch.Tensor,
-                center_embed_i: torch.Tensor,
-                x_j: torch.Tensor,
-                edge_attr: torch.Tensor,
-                rotate_mat: Optional[torch.Tensor],
-                index: torch.Tensor,
-                size_i: int) -> torch.Tensor:
-        if rotate_mat is None:
-            nbr_embed = self.nbr_embed([x_j, edge_attr])
-        else:
-            # if self.parallel:
-            center_rotate_mat = rotate_mat.repeat(self.historical_steps, 1, 1)[edge_index[1]]
-            # else:
-            #     center_rotate_mat = rotate_mat[edge_index[1]]
-            nbr_embed = self.nbr_embed([torch.bmm(x_j.unsqueeze(-2), center_rotate_mat).squeeze(-2),
-                                        torch.bmm(edge_attr.unsqueeze(-2), center_rotate_mat).squeeze(-2)])
+        node_edge_index, counts = torch.unique_consecutive(edge_index[0], return_counts=True)
+        counts = torch.cumsum(torch.cat([torch.tensor([0]).cuda(), counts]), dim = 0)
+        fixed_edge_index = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+        count_index(x.shape[0], node_edge_index, counts, fixed_edge_index)
+        center_embed = torch.zeros_like(center_embed1)
+        x_j = torch.zeros([edge_index.shape[1], 2], device=x.device)
+        gat2(center_embed1, x, center_embed, x_j,
+             fixed_edge_index, edge_index[1],
+             self.norm1.weight, self.norm1.bias)
+        center_embed_i = center_embed.index_select(self.node_dim, edge_index[0])
+        
+        index = edge_index[0]
+        size: List[int] = [x.size(self.node_dim), center_embed.size(self.node_dim)]
+        assert size[1] >= 0
+        dim_size = size_i = size[1] if size[1] >= 0 else size[0]
+
+        # message
+        center_rotate_mat = rotate_mat.repeat(self.historical_steps, 1, 1)[edge_index[0]]
+        nbr_embed = self.nbr_embed([torch.bmm(x_j.unsqueeze(-2), center_rotate_mat).squeeze(-2),
+                                    torch.bmm(edge_attr.unsqueeze(-2), center_rotate_mat).squeeze(-2)])
         query = self.lin_q(center_embed_i).view(-1, self.num_heads, self.embed_dim // self.num_heads)
         key = self.lin_k(nbr_embed).view(-1, self.num_heads, self.embed_dim // self.num_heads)
         value = self.lin_v(nbr_embed).view(-1, self.num_heads, self.embed_dim // self.num_heads)
@@ -179,42 +178,26 @@ class AAEncoder(MessagePassing):
         alpha = (query * key).sum(dim=-1) / scale
         alpha = softmax(alpha, index, size_i)
         alpha = self.attn_drop(alpha)
-        return value * alpha.unsqueeze(-1)
+        out = value * alpha.unsqueeze(-1)
 
-    def update(self,
-               inputs: torch.Tensor,
-               center_embed: torch.Tensor) -> torch.Tensor:
-        inputs = inputs.view(-1, self.embed_dim)
-        gate = torch.sigmoid(self.lin_ih(inputs) + self.lin_hh(center_embed))
-        return inputs + gate * (self.lin_self(center_embed) - inputs)
+        # aggregate
+        boradcast_size = [1] * out.dim()
+        boradcast_size[self.node_dim] = -1
+        index = index.view(boradcast_size).expand_as(out)
 
-    def propagate(self, edge_index: torch.Tensor, x, center_embed, edge_attr, rotate_mat: Optional[torch.Tensor]):
-        size: List[int] = [-1, -1]
+        size = list(out.size())
+        size[self.node_dim] = dim_size
+        out = out.new_zeros(size).scatter_add_(self.node_dim, index, out)
 
-        i, j = 1, 0
-        center_embed_i = self._collect(center_embed, edge_index, size, i)
-        x_j = self._collect(x, edge_index, size, j)
-        
-        index = edge_index[i]
-        dim_size = size_i = size[i] if size[i] >= 0 else size[j]
+        # update
+        out = out.view(-1, self.embed_dim)
+        gate = torch.sigmoid(self.lin_ih(out) + self.lin_hh(center_embed))
+        out = out + gate * (self.lin_self(center_embed) - out)
 
-        out = self.message(edge_index, center_embed_i, x_j, edge_attr, rotate_mat, index, size_i)
-        out = self.aggregate(out, index, dim_size)
-        out = self.update(out, center_embed)
-        return out
-
-    def _mha_block(self,
-                   center_embed: torch.Tensor,
-                   x: torch.Tensor,
-                   edge_index: torch.Tensor,
-                   edge_attr: torch.Tensor,
-                   rotate_mat: Optional[torch.Tensor]) -> torch.Tensor:
-        center_embed = self.out_proj(self.propagate(edge_index=edge_index, x=x, center_embed=center_embed,
-                                                    edge_attr=edge_attr, rotate_mat=rotate_mat))
-        return self.proj_drop(center_embed)
-
-    def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(x)
+        center_embed = self.out_proj(out)
+        center_embed = center_embed1 + self.proj_drop(center_embed)
+        center_embed = center_embed + self.mlp(self.norm2(center_embed))
+        return center_embed
 
 
 class TemporalEncoder(nn.Module):

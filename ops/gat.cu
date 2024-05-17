@@ -51,9 +51,9 @@ at::Tensor scatter_max(
   const int threads = 1024;
   const int blocks = src.sizes()[0] / threads + 1;
   scatter_max_kernel<float, 8><<<blocks, threads>>>(
-    src.data<float>(),
-    index.data<int64_t>(),
-    result.data<float>(),
+    src.data_ptr<float>(),
+    index.data_ptr<int64_t>(),
+    result.data_ptr<float>(),
     src.sizes()[0]);
 
   return result;
