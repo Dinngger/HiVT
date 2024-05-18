@@ -137,6 +137,11 @@ class AAEncoder(torch.nn.Module):
                 edge_attr: torch.Tensor,
                 bos_mask: torch.Tensor,
                 rotate_mat: torch.Tensor) -> torch.Tensor:
+        node_edge_index, counts = torch.unique_consecutive(edge_index[0], return_counts=True)
+        counts = torch.cumsum(torch.cat([torch.tensor([0]).cuda(), counts]), dim = 0)
+        fixed_edge_index = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+        count_index(x.shape[0], node_edge_index, counts, fixed_edge_index)
+
         center_embed = \
             torch.matmul(x.view(self.historical_steps, x.shape[0] // self.historical_steps, -1).unsqueeze(-2),
                          rotate_mat.expand(self.historical_steps, rotate_mat.shape[0], 2, 2)).squeeze(-2)
@@ -151,48 +156,33 @@ class AAEncoder(torch.nn.Module):
             bos_mask, self.bos_token)
         center_embed1 = center_embed1.reshape(x.shape[0], -1)
 
-        node_edge_index, counts = torch.unique_consecutive(edge_index[0], return_counts=True)
-        counts = torch.cumsum(torch.cat([torch.tensor([0]).cuda(), counts]), dim = 0)
-        fixed_edge_index = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
-        count_index(x.shape[0], node_edge_index, counts, fixed_edge_index)
-        center_embed = torch.zeros_like(center_embed1)
-        x_j = torch.zeros([edge_index.shape[1], 2], device=x.device)
-        gat2(center_embed1, x, center_embed, x_j,
+        out = torch.zeros_like(center_embed1)
+        ce_out = torch.zeros_like(center_embed1)
+        gate = torch.zeros_like(center_embed1)
+        gat2(center_embed1, x, out, ce_out, gate,
              fixed_edge_index, edge_index[1],
-             self.norm1.weight, self.norm1.bias)
-        center_embed_i = center_embed.index_select(self.node_dim, edge_index[0])
-        
-        index = edge_index[0]
-        size: List[int] = [x.size(self.node_dim), center_embed.size(self.node_dim)]
-        assert size[1] >= 0
-        dim_size = size_i = size[1] if size[1] >= 0 else size[0]
-
-        # message
-        center_rotate_mat = rotate_mat.repeat(self.historical_steps, 1, 1)[edge_index[0]]
-        nbr_embed = self.nbr_embed([torch.bmm(x_j.unsqueeze(-2), center_rotate_mat).squeeze(-2),
-                                    torch.bmm(edge_attr.unsqueeze(-2), center_rotate_mat).squeeze(-2)])
-        query = self.lin_q(center_embed_i).view(-1, self.num_heads, self.embed_dim // self.num_heads)
-        key = self.lin_k(nbr_embed).view(-1, self.num_heads, self.embed_dim // self.num_heads)
-        value = self.lin_v(nbr_embed).view(-1, self.num_heads, self.embed_dim // self.num_heads)
-        scale = (self.embed_dim // self.num_heads) ** 0.5
-        alpha = (query * key).sum(dim=-1) / scale
-        alpha = softmax(alpha, index, size_i)
-        alpha = self.attn_drop(alpha)
-        out = value * alpha.unsqueeze(-1)
-
-        # aggregate
-        boradcast_size = [1] * out.dim()
-        boradcast_size[self.node_dim] = -1
-        index = index.view(boradcast_size).expand_as(out)
-
-        size = list(out.size())
-        size[self.node_dim] = dim_size
-        out = out.new_zeros(size).scatter_add_(self.node_dim, index, out)
+             self.norm1.weight, self.norm1.bias,
+             rotate_mat, edge_attr,
+             self.nbr_embed.module_list[0][0].weight, self.nbr_embed.module_list[0][0].bias,
+             self.nbr_embed.module_list[0][1].weight, self.nbr_embed.module_list[0][1].bias,
+             self.nbr_embed.module_list[0][3].weight, self.nbr_embed.module_list[0][3].bias,
+             self.nbr_embed.module_list[1][0].weight, self.nbr_embed.module_list[1][0].bias,
+             self.nbr_embed.module_list[1][1].weight, self.nbr_embed.module_list[1][1].bias,
+             self.nbr_embed.module_list[1][3].weight, self.nbr_embed.module_list[1][3].bias,
+             self.nbr_embed.aggr_embed[0].weight, self.nbr_embed.aggr_embed[0].bias,
+             self.nbr_embed.aggr_embed[2].weight, self.nbr_embed.aggr_embed[2].bias,
+             self.nbr_embed.aggr_embed[3].weight, self.nbr_embed.aggr_embed[3].bias,
+             self.lin_q.weight, self.lin_q.bias,
+             self.lin_k.weight, self.lin_k.bias,
+             self.lin_v.weight, self.lin_v.bias,
+             self.lin_ih.weight, self.lin_ih.bias,
+             self.lin_hh.weight, self.lin_hh.bias,
+             self.lin_self.weight, self.lin_self.bias,
+             self.out_proj.weight, self.out_proj.bias)
 
         # update
-        out = out.view(-1, self.embed_dim)
-        gate = torch.sigmoid(self.lin_ih(out) + self.lin_hh(center_embed))
-        out = out + gate * (self.lin_self(center_embed) - out)
+        # gate = torch.sigmoid(gates)
+        # out = out + gate * (self.lin_self(ce_out) - out)
 
         center_embed = self.out_proj(out)
         center_embed = center_embed1 + self.proj_drop(center_embed)
