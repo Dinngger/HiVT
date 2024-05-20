@@ -23,7 +23,7 @@ from mypyg.utils import softmax, subgraph
 from models import MultipleInputEmbedding
 from models import SingleInputEmbedding
 from utils import distance_drop_edge, init_weights
-from ops.gat import gat, gat2, count_index
+from ops.gat import gat, gat2, count_index, out_proj
 
 
 class LocalEncoder(nn.Module):
@@ -157,9 +157,7 @@ class AAEncoder(torch.nn.Module):
         center_embed1 = center_embed1.reshape(x.shape[0], -1)
 
         out = torch.zeros_like(center_embed1)
-        ce_out = torch.zeros_like(center_embed1)
-        gate = torch.zeros_like(center_embed1)
-        gat2(center_embed1, x, out, ce_out, gate,
+        gat2(center_embed1, x, out,
              fixed_edge_index, edge_index[1],
              self.norm1.weight, self.norm1.bias,
              rotate_mat, edge_attr,
@@ -184,7 +182,10 @@ class AAEncoder(torch.nn.Module):
         # gate = torch.sigmoid(gates)
         # out = out + gate * (self.lin_self(ce_out) - out)
 
-        center_embed = self.out_proj(out)
+        center_embed = torch.zeros_like(out)
+        out_proj(out, center_embed, self.out_proj.weight, self.out_proj.bias)
+        center_embed_true = torch.mm(out, self.out_proj.weight.t()) + self.out_proj.bias
+        assert (center_embed == center_embed_true).all(), f"{center_embed[0]} != {center_embed_true[0]}"
         center_embed = center_embed1 + self.proj_drop(center_embed)
         center_embed = center_embed + self.mlp(self.norm2(center_embed))
         return center_embed

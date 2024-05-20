@@ -74,7 +74,7 @@ def gat(x: t3,
             out[b, n, i] = ce[i]
 
 @ti.kernel
-def gat2(ces: t2, x: t2, out: t2, ce_out: t2, gates: t2,
+def gat2(ces: t2, x: t2, out: t2,
          edge_begins: t1i, edge_index: t1i,
          n1_w: t1, n1_b: t1,
          rotate: t3, edge_attr: t2,
@@ -99,8 +99,6 @@ def gat2(ces: t2, x: t2, out: t2, ce_out: t2, gates: t2,
         for i in ti.static(range(64)):
             ce[i] = ces[idx, i]
         ce = layer_norm(ce, n1_w, n1_b)
-        for i in ti.static(range(64)):
-            ce_out[idx, i] = ce[i]
         query = linear64(ce, q_w, q_b)
         cr_i = idx % (ces.shape[0] // 20)
         cr = ti.Matrix([[rotate[cr_i, 0, 0], rotate[cr_i, 0, 1]],
@@ -164,7 +162,18 @@ def gat2(ces: t2, x: t2, out: t2, ce_out: t2, gates: t2,
         # out_sum = linear64(out_sum, out_w, out_b)
         for i in ti.static(range(64)):
             out[idx, i] = out_sum[i]
-            gates[idx, i] = gate[i]
+
+@ti.kernel
+def out_proj(xs: t2, out: t2, w: t2, b: t1):
+    for n in range(xs.shape[0]):
+        x = ti.Vector.zero(ti.f32, 64)
+        # for i in range(64):
+        #     for j in range(64):
+        #         x[i] += xs[n, j] * w[i, j]
+        #     x[i] += b[i]
+        x = linear64(x, w, b)
+        for i in ti.static(range(64)):
+            out[n, i] = x[i]
 
 
 @ti.kernel
