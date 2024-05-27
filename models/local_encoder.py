@@ -13,6 +13,7 @@
 # limitations under the License.
 from typing import Optional, Tuple, List, Dict
 
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,7 +24,8 @@ from mypyg.utils import softmax, subgraph
 from models import MultipleInputEmbedding
 from models import SingleInputEmbedding
 from utils import distance_drop_edge, init_weights
-from ops.gat import gat, gat2, count_index, out_proj
+from ops.ti_gat import count_index, gat
+# from ops.tl_gat import gat
 
 
 class LocalEncoder(nn.Module):
@@ -141,53 +143,39 @@ class AAEncoder(torch.nn.Module):
         counts = torch.cumsum(torch.cat([torch.tensor([0]).cuda(), counts]), dim = 0)
         fixed_edge_index = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
         count_index(x.shape[0], node_edge_index, counts, fixed_edge_index)
+        # fixed_edge_index[-1] = edge_index.shape[1]
 
-        center_embed = \
-            torch.matmul(x.view(self.historical_steps, x.shape[0] // self.historical_steps, -1).unsqueeze(-2),
-                         rotate_mat.expand(self.historical_steps, rotate_mat.shape[0], 2, 2)).squeeze(-2)
-        center_embed1 = torch.zeros(center_embed.shape[0], center_embed.shape[1], 64, device=center_embed.device)
-        gat(center_embed, center_embed1,
+        center_embed = torch.zeros(x.shape[0], 64, device=x.device)
+        gat(x, center_embed, rotate_mat,
             self.center_embed.embed[0].weight, self.center_embed.embed[0].bias,
             self.center_embed.embed[1].weight, self.center_embed.embed[1].bias,
             self.center_embed.embed[3].weight, self.center_embed.embed[3].bias,
             self.center_embed.embed[4].weight, self.center_embed.embed[4].bias,
             self.center_embed.embed[6].weight, self.center_embed.embed[6].bias,
             self.center_embed.embed[7].weight, self.center_embed.embed[7].bias,
-            bos_mask, self.bos_token)
-        center_embed1 = center_embed1.reshape(x.shape[0], -1)
-
-        out = torch.zeros_like(center_embed1)
-        gat2(center_embed1, x, out,
-             fixed_edge_index, edge_index[1],
-             self.norm1.weight, self.norm1.bias,
-             rotate_mat, edge_attr,
-             self.nbr_embed.module_list[0][0].weight, self.nbr_embed.module_list[0][0].bias,
-             self.nbr_embed.module_list[0][1].weight, self.nbr_embed.module_list[0][1].bias,
-             self.nbr_embed.module_list[0][3].weight, self.nbr_embed.module_list[0][3].bias,
-             self.nbr_embed.module_list[1][0].weight, self.nbr_embed.module_list[1][0].bias,
-             self.nbr_embed.module_list[1][1].weight, self.nbr_embed.module_list[1][1].bias,
-             self.nbr_embed.module_list[1][3].weight, self.nbr_embed.module_list[1][3].bias,
-             self.nbr_embed.aggr_embed[0].weight, self.nbr_embed.aggr_embed[0].bias,
-             self.nbr_embed.aggr_embed[2].weight, self.nbr_embed.aggr_embed[2].bias,
-             self.nbr_embed.aggr_embed[3].weight, self.nbr_embed.aggr_embed[3].bias,
-             self.lin_q.weight, self.lin_q.bias,
-             self.lin_k.weight, self.lin_k.bias,
-             self.lin_v.weight, self.lin_v.bias,
-             self.lin_ih.weight, self.lin_ih.bias,
-             self.lin_hh.weight, self.lin_hh.bias,
-             self.lin_self.weight, self.lin_self.bias,
-             self.out_proj.weight, self.out_proj.bias)
-
-        # update
-        # gate = torch.sigmoid(gates)
-        # out = out + gate * (self.lin_self(ce_out) - out)
-
-        center_embed = torch.zeros_like(out)
-        out_proj(out, center_embed, self.out_proj.weight, self.out_proj.bias)
-        center_embed_true = torch.mm(out, self.out_proj.weight.t()) + self.out_proj.bias
-        assert (center_embed == center_embed_true).all(), f"{center_embed[0]} != {center_embed_true[0]}"
-        center_embed = center_embed1 + self.proj_drop(center_embed)
-        center_embed = center_embed + self.mlp(self.norm2(center_embed))
+            bos_mask, self.bos_token,
+            fixed_edge_index, edge_index[1],
+            self.norm1.weight, self.norm1.bias,
+            edge_attr,
+            self.nbr_embed.module_list[0][0].weight, self.nbr_embed.module_list[0][0].bias,
+            self.nbr_embed.module_list[0][1].weight, self.nbr_embed.module_list[0][1].bias,
+            self.nbr_embed.module_list[0][3].weight, self.nbr_embed.module_list[0][3].bias,
+            self.nbr_embed.module_list[1][0].weight, self.nbr_embed.module_list[1][0].bias,
+            self.nbr_embed.module_list[1][1].weight, self.nbr_embed.module_list[1][1].bias,
+            self.nbr_embed.module_list[1][3].weight, self.nbr_embed.module_list[1][3].bias,
+            self.nbr_embed.aggr_embed[0].weight, self.nbr_embed.aggr_embed[0].bias,
+            self.nbr_embed.aggr_embed[2].weight, self.nbr_embed.aggr_embed[2].bias,
+            self.nbr_embed.aggr_embed[3].weight, self.nbr_embed.aggr_embed[3].bias,
+            self.lin_q.weight, self.lin_q.bias,
+            self.lin_k.weight, self.lin_k.bias,
+            self.lin_v.weight, self.lin_v.bias,
+            self.lin_ih.weight, self.lin_ih.bias,
+            self.lin_hh.weight, self.lin_hh.bias,
+            self.lin_self.weight, self.lin_self.bias,
+            self.out_proj.weight, self.out_proj.bias,
+            self.norm2.weight, self.norm2.bias,
+            self.mlp[0].weight, self.mlp[0].bias,
+            self.mlp[3].weight, self.mlp[3].bias)
         return center_embed
 
 

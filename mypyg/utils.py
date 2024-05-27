@@ -44,7 +44,7 @@ def scatter(src: Tensor, index: Tensor, dim: int,
     raise ValueError(f"Encountered invalid `reduce` argument '{reduce}'")
 
 
-gat_cu = load(name="gat", sources=["ops/gat.cu"], extra_cflags=['-O2'], verbose=True)
+scatter_max_cu = load(name="scatter_max", sources=["ops/scatter_max.cu"], extra_cflags=['-O2'], verbose=True)
 
 def softmax(
     src: Tensor,
@@ -53,7 +53,7 @@ def softmax(
     dim: int = 0,
 ) -> Tensor:
     N = num_nodes
-    src_max = gat_cu.scatter_max(src.detach(), index, dim, N)
+    src_max = scatter_max_cu.scatter_max(src.detach(), index, dim, N)
     # src_max = scatter(src.detach(), index, dim, dim_size=N, reduce='max')
     out = src - src_max.index_select(dim, index)
     out = out.exp()

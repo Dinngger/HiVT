@@ -26,6 +26,24 @@ def linear64(x, w: t2, b: t1):
     return res
 
 @ti.func
+def linear64_256(x, w: t2, b: t1):
+    res = ti.Vector.zero(ti.f32, 256)
+    for i in range(256):
+        res[i] = b[i]
+        for j in ti.static(range(64)):
+            res[i] += w[i, j] * x[j]
+    return res
+
+@ti.func
+def linear256_64(x, w: t2, b: t1):
+    res = ti.Vector.zero(ti.f32, 64)
+    for i in range(64):
+        res[i] = b[i]
+        for j in range(256):
+            res[i] += w[i, j] * x[j]
+    return res
+
+@ti.func
 def layer_norm(x, gamma: t1, beta: t1):
     mean: ti.f32 = 0.0
     for i in ti.static(range(64)):
@@ -47,18 +65,55 @@ def relu(x):
         x[i] = ti.max(x[i], 0)
     return x
 
+@ti.func
+def relu256(x):
+    for i in range(256):
+        x[i] = ti.max(x[i], 0)
+    return x
+
+@ti.func
+def write_back(out: t2, idx, val):
+    for i in ti.static(range(64)):
+        out[idx, i] = val[i]
+
 @ti.kernel
-def gat(x: t3,
-        out: t3,
+def gat(x: t2, out: t2, rotate: t3,
         ce_0_w: t2, ce_0_b: t1,
         ce_1_w: t1, ce_1_b: t1,
         ce_3_w: t2, ce_3_b: t1,
         ce_4_w: t1, ce_4_b: t1,
         ce_6_w: t2, ce_6_b: t1,
         ce_7_w: t1, ce_7_b: t1,
-        bos_mask: t2u, bos_token: t2):
-    for b, n in ti.ndrange(x.shape[0], x.shape[1]):
-        ce = linear2(ti.Vector([x[b, n, 0], x[b, n, 1]]), ce_0_w, ce_0_b)
+        bos_mask: t2u, bos_token: t2,
+        edge_begins: t1i, edge_index: t1i,
+        n1_w: t1, n1_b: t1,
+        edge_attr: t2,
+        nbr_0_w: t2, nbr_0_b: t1,
+        nbr_1_w: t1, nbr_1_b: t1,
+        nbr_3_w: t2, nbr_3_b: t1,
+        ea_0_w: t2, ea_0_b: t1,
+        ea_1_w: t1, ea_1_b: t1,
+        ea_3_w: t2, ea_3_b: t1,
+        aggr_0_w: t1, aggr_0_b: t1,
+        aggr_2_w: t2, aggr_2_b: t1,
+        aggr_3_w: t1, aggr_3_b: t1,
+        q_w: t2, q_b: t1,
+        k_w: t2, k_b: t1,
+        v_w: t2, v_b: t1,
+        ih_w: t2, ih_b: t1,
+        hh_w: t2, hh_b: t1,
+        self_w: t2, self_b: t1,
+        out_w: t2, out_b: t1,
+        n2_w: t1, n2_b: t1,
+        mlp_0_w: t2, mlp_0_b: t1,
+        mlp_3_w: t2, mlp_3_b: t1):
+    for idx in range(x.shape[0]):
+        n = idx % (x.shape[0] // 20)
+        b = idx // (x.shape[0] // 20)
+        cr = ti.Matrix([[rotate[n, 0, 0], rotate[n, 0, 1]],
+                        [rotate[n, 1, 0], rotate[n, 1, 1]]]).transpose()
+        xi = cr @ ti.Vector([x[idx, 0], x[idx, 1]])
+        ce = linear2(xi, ce_0_w, ce_0_b)
         ce = layer_norm(ce, ce_1_w, ce_1_b)
         ce = relu(ce)
         ce = linear64(ce, ce_3_w, ce_3_b)
@@ -70,40 +125,11 @@ def gat(x: t3,
         if bos_mask[n, b]:
             for i in ti.static(range(64)):
                 ce[i] = bos_token[b, i]
-        for i in ti.static(range(64)):
-            out[b, n, i] = ce[i]
+        old_ce = ce
 
-@ti.kernel
-def gat2(ces: t2, x: t2, out: t2,
-         edge_begins: t1i, edge_index: t1i,
-         n1_w: t1, n1_b: t1,
-         rotate: t3, edge_attr: t2,
-         nbr_0_w: t2, nbr_0_b: t1,
-         nbr_1_w: t1, nbr_1_b: t1,
-         nbr_3_w: t2, nbr_3_b: t1,
-         ea_0_w: t2, ea_0_b: t1,
-         ea_1_w: t1, ea_1_b: t1,
-         ea_3_w: t2, ea_3_b: t1,
-         aggr_0_w: t1, aggr_0_b: t1,
-         aggr_2_w: t2, aggr_2_b: t1,
-         aggr_3_w: t1, aggr_3_b: t1,
-         q_w: t2, q_b: t1,
-         k_w: t2, k_b: t1,
-         v_w: t2, v_b: t1,
-         ih_w: t2, ih_b: t1,
-         hh_w: t2, hh_b: t1,
-         self_w: t2, self_b: t1,
-         out_w: t2, out_b: t1):
-    for idx in range(ces.shape[0]):
-        ce = ti.Vector.zero(ti.f32, 64)
-        for i in ti.static(range(64)):
-            ce[i] = ces[idx, i]
         ce = layer_norm(ce, n1_w, n1_b)
         query = linear64(ce, q_w, q_b)
-        cr_i = idx % (ces.shape[0] // 20)
-        cr = ti.Matrix([[rotate[cr_i, 0, 0], rotate[cr_i, 0, 1]],
-                        [rotate[cr_i, 1, 0], rotate[cr_i, 1, 1]]]).transpose()
-        end = edge_index.shape[0] if idx == ces.shape[0] - 1 else edge_begins[idx + 1]
+        end = edge_index.shape[0] if idx == x.shape[0] - 1 else edge_begins[idx + 1]
         first: ti.u1 = True
         alpha_sum = ti.Vector.one(ti.f32, 8)
         alpha_max = ti.Vector.one(ti.f32, 8)
@@ -157,24 +183,15 @@ def gat2(ces: t2, x: t2, out: t2,
         gate = linear64(out_sum, ih_w, ih_b) + linear64(ce, hh_w, hh_b)
         gate = 1.0 / (1.0 + ti.exp(-gate))
         self_diff = linear64(ce, self_w, self_b) - out_sum
-        for i in ti.static(range(64)):
-            out_sum[i] += gate[i] * self_diff[i]
-        # out_sum = linear64(out_sum, out_w, out_b)
-        for i in ti.static(range(64)):
-            out[idx, i] = out_sum[i]
-
-@ti.kernel
-def out_proj(xs: t2, out: t2, w: t2, b: t1):
-    for n in range(xs.shape[0]):
-        x = ti.Vector.zero(ti.f32, 64)
-        # for i in range(64):
-        #     for j in range(64):
-        #         x[i] += xs[n, j] * w[i, j]
-        #     x[i] += b[i]
-        x = linear64(x, w, b)
-        for i in ti.static(range(64)):
-            out[n, i] = x[i]
-
+        out_sum += gate * self_diff
+        out_sum = linear64(out_sum, out_w, out_b)
+        out_sum = old_ce + out_sum
+        out_mlp = layer_norm(out_sum, n2_w, n2_b)
+        out_mlp2 = linear64_256(out_mlp, mlp_0_w, mlp_0_b)
+        out_mlp2 = relu256(out_mlp2)
+        out_mlp = linear256_64(out_mlp2, mlp_3_w, mlp_3_b)
+        out_sum = out_mlp + out_sum
+        write_back(out, idx, out_sum)
 
 @ti.kernel
 def count_index(len: ti.i64, edge: t1i, counts: t1i, out: t1i):
