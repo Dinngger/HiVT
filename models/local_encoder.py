@@ -13,10 +13,12 @@
 # limitations under the License.
 from typing import Optional, Tuple, List, Dict
 
+import os
 import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.cpp_extension import load
 from mypyg.data import Data, combine_batch_data
 from mypyg.conv import MessagePassing
 from mypyg.utils import softmax, subgraph
@@ -26,6 +28,7 @@ from models import SingleInputEmbedding
 from utils import distance_drop_edge, init_weights
 from ops.ti_gat import count_index, gat
 # from ops.tl_gat import gat
+flash_gat = load(name="flash_gat", sources=["ops/flash_gat_single.cu"], extra_cuda_cflags=['-O2', '--ptxas-options=-v'], verbose=True)
 
 
 class LocalEncoder(nn.Module):
@@ -133,6 +136,70 @@ class AAEncoder(torch.nn.Module):
         self.apply(init_weights)
     
     def forward(self,
+                   x: torch.Tensor,
+                   t: Optional[int],
+                   edge_index: torch.Tensor,
+                   edge_attr: torch.Tensor,
+                   bos_mask: torch.Tensor,
+                   rotate_mat: torch.Tensor) -> torch.Tensor:
+        return self.forward_pt(x, t, edge_index, edge_attr, bos_mask, rotate_mat)
+
+    def forward_pt(self,
+                   x: torch.Tensor,
+                   t: Optional[int],
+                   edge_index: torch.Tensor,
+                   edge_attr: torch.Tensor,
+                   bos_mask: torch.Tensor,
+                   rotate_mat: torch.Tensor) -> torch.Tensor:
+        center_embed = self.center_embed(
+            torch.matmul(x.view(self.historical_steps, x.shape[0] // self.historical_steps, -1).unsqueeze(-2),
+                         rotate_mat.expand(self.historical_steps, rotate_mat.shape[0], 2, 2)).squeeze(-2))
+        center_embed = torch.where(bos_mask.t().unsqueeze(-1),
+                                    self.bos_token.unsqueeze(-2),
+                                    center_embed).reshape(x.shape[0], -1)
+        center_embed1 = center_embed
+        center_embed = self.norm1(center_embed)
+        center_embed_i = center_embed.index_select(self.node_dim, edge_index[0])
+        x_j = x.index_select(self.node_dim, edge_index[1])
+        
+        index = edge_index[0]
+        size: List[int] = [x.size(self.node_dim), center_embed.size(self.node_dim)]
+        assert size[1] >= 0
+        dim_size = size_i = size[1] if size[1] >= 0 else size[0]
+
+        # message
+        center_rotate_mat = rotate_mat.repeat(self.historical_steps, 1, 1)[edge_index[0]]
+        nbr_embed = self.nbr_embed([torch.bmm(x_j.unsqueeze(-2), center_rotate_mat).squeeze(-2),
+                                    torch.bmm(edge_attr.unsqueeze(-2), center_rotate_mat).squeeze(-2)])
+        query = self.lin_q(center_embed_i).view(-1, self.num_heads, self.embed_dim // self.num_heads)
+        key = self.lin_k(nbr_embed).view(-1, self.num_heads, self.embed_dim // self.num_heads)
+        value = self.lin_v(nbr_embed).view(-1, self.num_heads, self.embed_dim // self.num_heads)
+        scale = (self.embed_dim // self.num_heads) ** 0.5
+        alpha = (query * key).sum(dim=-1) / scale
+        alpha = softmax(alpha, index, size_i)
+        alpha = self.attn_drop(alpha)
+        out = value * alpha.unsqueeze(-1)
+
+        # aggregate
+        boradcast_size = [1] * out.dim()
+        boradcast_size[self.node_dim] = -1
+        index = index.view(boradcast_size).expand_as(out)
+
+        size = list(out.size())
+        size[self.node_dim] = dim_size
+        out = out.new_zeros(size).scatter_add_(self.node_dim, index, out)
+
+        # update
+        out = out.view(-1, self.embed_dim)
+        gate = torch.sigmoid(self.lin_ih(out) + self.lin_hh(center_embed))
+        out = out + gate * (self.lin_self(center_embed) - out)
+
+        center_embed = self.out_proj(out)
+        center_embed = center_embed1 + self.proj_drop(center_embed)
+        center_embed = center_embed + self.mlp(self.norm2(center_embed))
+        return center_embed
+
+    def forward_flash(self,
                 x: torch.Tensor,
                 t: Optional[int],
                 edge_index: torch.Tensor,
@@ -140,42 +207,111 @@ class AAEncoder(torch.nn.Module):
                 bos_mask: torch.Tensor,
                 rotate_mat: torch.Tensor) -> torch.Tensor:
         node_edge_index, counts = torch.unique_consecutive(edge_index[0], return_counts=True)
-        counts = torch.cumsum(torch.cat([torch.tensor([0]).cuda(), counts]), dim = 0)
         fixed_edge_index = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
-        count_index(x.shape[0], node_edge_index, counts, fixed_edge_index)
-        # fixed_edge_index[-1] = edge_index.shape[1]
+        fixed_edge_index[node_edge_index] = counts
+        fixed_edge_index = torch.cumsum(torch.cat([torch.tensor([0]).cuda(), fixed_edge_index]), dim=0)
 
         center_embed = torch.zeros(x.shape[0], 64, device=x.device)
-        gat(x, center_embed, rotate_mat,
-            self.center_embed.embed[0].weight, self.center_embed.embed[0].bias,
-            self.center_embed.embed[1].weight, self.center_embed.embed[1].bias,
-            self.center_embed.embed[3].weight, self.center_embed.embed[3].bias,
-            self.center_embed.embed[4].weight, self.center_embed.embed[4].bias,
-            self.center_embed.embed[6].weight, self.center_embed.embed[6].bias,
-            self.center_embed.embed[7].weight, self.center_embed.embed[7].bias,
-            bos_mask, self.bos_token,
-            fixed_edge_index, edge_index[1],
-            self.norm1.weight, self.norm1.bias,
-            edge_attr,
-            self.nbr_embed.module_list[0][0].weight, self.nbr_embed.module_list[0][0].bias,
-            self.nbr_embed.module_list[0][1].weight, self.nbr_embed.module_list[0][1].bias,
-            self.nbr_embed.module_list[0][3].weight, self.nbr_embed.module_list[0][3].bias,
-            self.nbr_embed.module_list[1][0].weight, self.nbr_embed.module_list[1][0].bias,
-            self.nbr_embed.module_list[1][1].weight, self.nbr_embed.module_list[1][1].bias,
-            self.nbr_embed.module_list[1][3].weight, self.nbr_embed.module_list[1][3].bias,
-            self.nbr_embed.aggr_embed[0].weight, self.nbr_embed.aggr_embed[0].bias,
-            self.nbr_embed.aggr_embed[2].weight, self.nbr_embed.aggr_embed[2].bias,
-            self.nbr_embed.aggr_embed[3].weight, self.nbr_embed.aggr_embed[3].bias,
-            self.lin_q.weight, self.lin_q.bias,
-            self.lin_k.weight, self.lin_k.bias,
-            self.lin_v.weight, self.lin_v.bias,
-            self.lin_ih.weight, self.lin_ih.bias,
-            self.lin_hh.weight, self.lin_hh.bias,
-            self.lin_self.weight, self.lin_self.bias,
-            self.out_proj.weight, self.out_proj.bias,
-            self.norm2.weight, self.norm2.bias,
-            self.mlp[0].weight, self.mlp[0].bias,
-            self.mlp[3].weight, self.mlp[3].bias)
+        if True:
+            flash_gat.flash_gat(x, center_embed, rotate_mat,
+                self.center_embed.embed[0].weight, self.center_embed.embed[0].bias,
+                self.center_embed.embed[1].weight, self.center_embed.embed[1].bias,
+                self.center_embed.embed[3].weight, self.center_embed.embed[3].bias,
+                self.center_embed.embed[4].weight, self.center_embed.embed[4].bias,
+                self.center_embed.embed[6].weight, self.center_embed.embed[6].bias,
+                self.center_embed.embed[7].weight, self.center_embed.embed[7].bias,
+                bos_mask, self.bos_token,
+                fixed_edge_index, edge_index,
+                self.norm1.weight, self.norm1.bias,
+                edge_attr,
+                self.nbr_embed.module_list[0][0].weight, self.nbr_embed.module_list[0][0].bias,
+                self.nbr_embed.module_list[0][1].weight, self.nbr_embed.module_list[0][1].bias,
+                self.nbr_embed.module_list[0][3].weight, self.nbr_embed.module_list[0][3].bias,
+                self.nbr_embed.module_list[1][0].weight, self.nbr_embed.module_list[1][0].bias,
+                self.nbr_embed.module_list[1][1].weight, self.nbr_embed.module_list[1][1].bias,
+                self.nbr_embed.module_list[1][3].weight, self.nbr_embed.module_list[1][3].bias,
+                self.nbr_embed.aggr_embed[0].weight, self.nbr_embed.aggr_embed[0].bias,
+                self.nbr_embed.aggr_embed[2].weight, self.nbr_embed.aggr_embed[2].bias,
+                self.nbr_embed.aggr_embed[3].weight, self.nbr_embed.aggr_embed[3].bias,
+                self.lin_q.weight, self.lin_q.bias,
+                self.lin_k.weight, self.lin_k.bias,
+                self.lin_v.weight, self.lin_v.bias,
+                self.lin_ih.weight, self.lin_ih.bias,
+                self.lin_hh.weight, self.lin_hh.bias,
+                self.lin_self.weight, self.lin_self.bias,
+                self.out_proj.weight, self.out_proj.bias,
+                self.norm2.weight, self.norm2.bias,
+                self.mlp[0].weight, self.mlp[0].bias,
+                self.mlp[3].weight, self.mlp[3].bias)
+        # if torch.isnan(center_embed).any():
+            # print('nan in center_embed')
+        if False:
+            gat(x, center_embed, rotate_mat,
+                self.center_embed.embed[0].weight, self.center_embed.embed[0].bias,
+                self.center_embed.embed[1].weight, self.center_embed.embed[1].bias,
+                self.center_embed.embed[3].weight, self.center_embed.embed[3].bias,
+                self.center_embed.embed[4].weight, self.center_embed.embed[4].bias,
+                self.center_embed.embed[6].weight, self.center_embed.embed[6].bias,
+                self.center_embed.embed[7].weight, self.center_embed.embed[7].bias,
+                bos_mask, self.bos_token,
+                fixed_edge_index, edge_index[1],
+                self.norm1.weight, self.norm1.bias,
+                edge_attr,
+                self.nbr_embed.module_list[0][0].weight, self.nbr_embed.module_list[0][0].bias,
+                self.nbr_embed.module_list[0][1].weight, self.nbr_embed.module_list[0][1].bias,
+                self.nbr_embed.module_list[0][3].weight, self.nbr_embed.module_list[0][3].bias,
+                self.nbr_embed.module_list[1][0].weight, self.nbr_embed.module_list[1][0].bias,
+                self.nbr_embed.module_list[1][1].weight, self.nbr_embed.module_list[1][1].bias,
+                self.nbr_embed.module_list[1][3].weight, self.nbr_embed.module_list[1][3].bias,
+                self.nbr_embed.aggr_embed[0].weight, self.nbr_embed.aggr_embed[0].bias,
+                self.nbr_embed.aggr_embed[2].weight, self.nbr_embed.aggr_embed[2].bias,
+                self.nbr_embed.aggr_embed[3].weight, self.nbr_embed.aggr_embed[3].bias,
+                self.lin_q.weight, self.lin_q.bias,
+                self.lin_k.weight, self.lin_k.bias,
+                self.lin_v.weight, self.lin_v.bias,
+                self.lin_ih.weight, self.lin_ih.bias,
+                self.lin_hh.weight, self.lin_hh.bias,
+                self.lin_self.weight, self.lin_self.bias,
+                self.out_proj.weight, self.out_proj.bias,
+                self.norm2.weight, self.norm2.bias,
+                self.mlp[0].weight, self.mlp[0].bias,
+                self.mlp[3].weight, self.mlp[3].bias)
+        if False:
+            tmp_m = nn.Module()
+            for i, t in enumerate([x, center_embed, rotate_mat,
+                self.center_embed.embed[0].weight, self.center_embed.embed[0].bias,
+                self.center_embed.embed[1].weight, self.center_embed.embed[1].bias,
+                self.center_embed.embed[3].weight, self.center_embed.embed[3].bias,
+                self.center_embed.embed[4].weight, self.center_embed.embed[4].bias,
+                self.center_embed.embed[6].weight, self.center_embed.embed[6].bias,
+                self.center_embed.embed[7].weight, self.center_embed.embed[7].bias,
+                bos_mask, self.bos_token,
+                fixed_edge_index, edge_index,
+                self.norm1.weight, self.norm1.bias,
+                edge_attr,
+                self.nbr_embed.module_list[0][0].weight, self.nbr_embed.module_list[0][0].bias,
+                self.nbr_embed.module_list[0][1].weight, self.nbr_embed.module_list[0][1].bias,
+                self.nbr_embed.module_list[0][3].weight, self.nbr_embed.module_list[0][3].bias,
+                self.nbr_embed.module_list[1][0].weight, self.nbr_embed.module_list[1][0].bias,
+                self.nbr_embed.module_list[1][1].weight, self.nbr_embed.module_list[1][1].bias,
+                self.nbr_embed.module_list[1][3].weight, self.nbr_embed.module_list[1][3].bias,
+                self.nbr_embed.aggr_embed[0].weight, self.nbr_embed.aggr_embed[0].bias,
+                self.nbr_embed.aggr_embed[2].weight, self.nbr_embed.aggr_embed[2].bias,
+                self.nbr_embed.aggr_embed[3].weight, self.nbr_embed.aggr_embed[3].bias,
+                self.lin_q.weight, self.lin_q.bias,
+                self.lin_k.weight, self.lin_k.bias,
+                self.lin_v.weight, self.lin_v.bias,
+                self.lin_ih.weight, self.lin_ih.bias,
+                self.lin_hh.weight, self.lin_hh.bias,
+                self.lin_self.weight, self.lin_self.bias,
+                self.out_proj.weight, self.out_proj.bias,
+                self.norm2.weight, self.norm2.bias,
+                self.mlp[0].weight, self.mlp[0].bias,
+                self.mlp[3].weight, self.mlp[3].bias]):
+                tmp_m.register_parameter(f"{i}", nn.Parameter(t, requires_grad=False))
+            torch.jit.script(tmp_m).save('gat_test.pt')
+            print('save gat_test.pt')
+            os._exit(0)
         return center_embed
 
 

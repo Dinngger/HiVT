@@ -129,12 +129,11 @@ def gat(x: t2, out: t2, rotate: t3,
 
         ce = layer_norm(ce, n1_w, n1_b)
         query = linear64(ce, q_w, q_b)
-        end = edge_index.shape[0] if idx == x.shape[0] - 1 else edge_begins[idx + 1]
         first: ti.u1 = True
         alpha_sum = ti.Vector.one(ti.f32, 8)
         alpha_max = ti.Vector.one(ti.f32, 8)
         out_sum = ti.Vector.zero(ti.f32, 64)
-        for e in range(edge_begins[idx], end):
+        for e in range(edge_begins[idx], edge_begins[idx + 1]):
             ei = edge_index[e]
 
             x_j2 = cr @ ti.Vector([x[ei, 0], x[ei, 1]])
