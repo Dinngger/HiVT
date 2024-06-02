@@ -29,18 +29,14 @@ __device__ inline float cr_dot(float cr, float xi, int head_idx) {
     return yi;
 }
 
-__device__ inline void load_64(float* dst, const float* ptr, int n) {
-    for (int i = 0; i < 64 * n; i += 64) {
-        dst[i + threadIdx.x] = ptr[i + threadIdx.x];
-        dst[i + threadIdx.x + 32] = ptr[i + threadIdx.x + 32];
-    }
+__device__ inline void load_64(float* dst, const float* ptr) {
+    dst[threadIdx.x] = ptr[threadIdx.x];
+    dst[threadIdx.x + 32] = ptr[threadIdx.x + 32];
 }
 
-__device__ inline void load_64_stride(float* dst, const float* ptr, int n, int s) {
-    for (int i = 0; i < 64 * n; i += 64) {
-        dst[i + threadIdx.x] = ptr[i * s + threadIdx.x];
-        dst[i + threadIdx.x + 32] = ptr[i * s + threadIdx.x + 32];
-    }
+__device__ inline void load_64_bank(float* dst, const float* ptr) {
+    dst[threadIdx.x] = ptr[threadIdx.x];
+    dst[threadIdx.x + 33] = ptr[threadIdx.x + 32];
 }
 
 __device__ inline void linear2(float* res, float x,
@@ -48,16 +44,19 @@ __device__ inline void linear2(float* res, float x,
     const float* weight_ptr, const float* bias_ptr,
     int head_idx) {
     
-    load_64(weight, weight_ptr, 2);
-    load_64(bias, bias_ptr, 1);
+    load_64_bank(weight, weight_ptr);
+    load_64_bank(weight + 66, weight_ptr + 64);
+    load_64_bank(bias, bias_ptr);
 
     float x0 = __shfl_sync(0xffffffff, x, 0, 8);
     float x1 = __shfl_sync(0xffffffff, x, 1, 8);
 
+    int weight_idx = head_idx * 16 + head_idx / 2;
+    int bias_idx = head_idx * 8 + head_idx / 4;
     for (int i = 0; i < 8; i++) {
-        int row = head_idx * 8 + i;
-        // bank conflict here
-        res[i] = x0 * weight[row * 2] + x1 * weight[row * 2 + 1] + bias[row];
+        int weight_idx_i = weight_idx + i * 2;
+        res[i] = x0 * weight[weight_idx_i] +
+                 x1 * weight[weight_idx_i + 1] + bias[bias_idx + i];
     }
 }
 
@@ -73,8 +72,8 @@ __device__ void layer_norm(float* inout,
     float* gamma, float* beta,
     const float* gamma_ptr, const float* beta_ptr, int head_idx) {
 
-    load_64(gamma, gamma_ptr, 1);
-    load_64(beta, beta_ptr, 1);
+    load_64_bank(gamma, gamma_ptr);
+    load_64_bank(beta, beta_ptr);
     __syncwarp();
 
     float mean = 0;
@@ -87,24 +86,25 @@ __device__ void layer_norm(float* inout,
     for (int i = 0; i < 8; i++)
         var += inout[i] * inout[i];
     var = rsqrtf(node_sum(var) / 64 + 1e-5);
-    for (int i = 0; i < 8; i++) // bank conflict here
-        inout[i] = inout[i] * var * gamma[head_idx * 8 + i] +
-                   beta[head_idx * 8 + i];
+    int bank_idx = head_idx * 8 + head_idx / 4;
+    for (int i = 0; i < 8; i++)
+        inout[i] = inout[i] * var * gamma[bank_idx + i] +
+                   beta[bank_idx + i];
 }
 
 __device__ void linear64(float* res, const float* x,
     float* weight, float* bias,
     const float* weight_ptr, const float* bias_ptr,
     int head_idx) {
-    load_64(bias, bias_ptr, 1);
+    load_64(bias, bias_ptr);
     for (int i = 0; i < 8; i++) {
-        load_64(weight, weight_ptr + i * 64 * 8, 8);
-        __syncwarp();
         for (int j = 0; j < 8; j++) {
+            load_64_bank(weight, weight_ptr + (i * 8 + j) * 64);
+            __syncwarp();
             float tmp = 0;
-            // bank conflict here
+            int weight_idx = head_idx * 8 + head_idx / 4;
             for (int k = 0; k < 8; k++)
-                tmp += x[k] * weight[j * 64 + head_idx * 8 + k];
+                tmp += x[k] * weight[weight_idx + k];
             tmp = node_sum(tmp) + bias[i * 8 + j];
             if (head_idx == i)  // save to i head.
                 res[j] = tmp;   // j value in i head.
@@ -116,15 +116,15 @@ __device__ inline void linear64_add(float* res, const float* x,
     float* weight, float* bias,
     const float* weight_ptr, const float* bias_ptr,
     int head_idx) {
-    load_64(bias, bias_ptr, 1);
+    load_64(bias, bias_ptr);
     for (int i = 0; i < 8; i++) {
-        load_64(weight, weight_ptr + i * 64 * 8, 8);
-        __syncwarp();
         for (int j = 0; j < 8; j++) {
+            load_64_bank(weight, weight_ptr + (i * 8 + j) * 64);
+            __syncwarp();
             float tmp = 0;
-            // bank conflict here
+            int weight_idx = head_idx * 8 + head_idx / 4;
             for (int k = 0; k < 8; k++)
-                tmp += x[k] * weight[j * 64 + head_idx * 8 + k];
+                tmp += x[k] * weight[weight_idx + k];
             tmp = node_sum(tmp) + bias[i * 8 + j];
             if (head_idx == i)  // save to i head.
                 res[j] += tmp;   // j value in i head.
@@ -137,15 +137,15 @@ __device__ inline void linear64_gate(float* res,
     float* weight, float* bias,
     const float* weight_ptr, const float* bias_ptr,
     int head_idx) {
-    load_64(bias, bias_ptr, 1);
+    load_64(bias, bias_ptr);
     for (int i = 0; i < 8; i++) {
-        load_64(weight, weight_ptr + i * 64 * 8, 8);
-        __syncwarp();
         for (int j = 0; j < 8; j++) {
+            load_64_bank(weight, weight_ptr + (i * 8 + j) * 64);
+            __syncwarp();
             float tmp = 0;
-            // bank conflict here
+            int weight_idx = head_idx * 8 + head_idx / 4;
             for (int k = 0; k < 8; k++)
-                tmp += x[k] * weight[j * 64 + head_idx * 8 + k];
+                tmp += x[k] * weight[weight_idx + k];
             tmp = node_sum(tmp) + bias[i * 8 + j];
             if (head_idx == i)  // save to i head.
                 res[j] += gate[j] * (tmp - res[j]);
@@ -162,15 +162,15 @@ __device__ inline void mlp256(float* out,
     for (int i = 0; i < 8; i++)
         out[i] = 0;
     for (int i = 0; i < 4; i++) {
-        load_64(bias, mlp_0_b + i * 64, 1);
+        load_64(bias, mlp_0_b + i * 64);
         for (int j = 0; j < 8; j++) {
-            load_64(weight, mlp_0_w + (i * 64 + j * 8) * 64, 8);
-            __syncwarp();
             for (int k = 0; k < 8; k++) {
+                load_64_bank(weight, mlp_0_w + (i * 64 + j * 8 + k) * 64);
+                __syncwarp();
                 float tmp = 0;
-                // bank conflict here
+                int weight_idx = head_idx * 8 + head_idx / 4;
                 for (int l = 0; l < 8; l++)
-                    tmp += x[l] * weight[k * 64 + head_idx * 8 + l];
+                    tmp += x[l] * weight[weight_idx + l];
                 tmp = node_sum(tmp) + bias[j * 8 + k];
                 if (head_idx == j)  // save to j head.
                     mid[k] = max(tmp, 0.0f);   // k value in j head.
@@ -178,23 +178,24 @@ __device__ inline void mlp256(float* out,
         }
 
         for (int j = 0; j < 8; j++) {
-            load_64_stride(weight, mlp_3_w + i * 64 + j * 4 * 8 * 64, 8, 4);
-            __syncwarp();
             for (int k = 0; k < 8; k++) {
+                load_64_bank(weight, mlp_3_w + (j * 4 * 8 + k * 4 + i) * 64);
+                __syncwarp();
                 float tmp = 0;
-                // bank conflict here
+                int weight_idx = head_idx * 8 + head_idx / 4;
                 for (int l = 0; l < 8; l++)
-                    tmp += mid[l] * weight[k * 64 + head_idx * 8 + l];
+                    tmp += mid[l] * weight[weight_idx + l];
                 tmp = node_sum(tmp);
                 if (head_idx == j)  // save to j head.
                     out[k] += tmp;   // k value in j head.
             }
         }
     }
-    load_64(bias, mlp_3_b, 1);
+    load_64_bank(bias, mlp_3_b);
     __syncwarp();
+    int bank_idx = head_idx * 8 + head_idx / 4;
     for (int i = 0; i < 8; i++)
-        out[i] += bias[head_idx * 8 + i];
+        out[i] += bias[bank_idx + i];
 }
 
 __device__ inline void relu(float* x) {
@@ -222,8 +223,27 @@ __device__ inline float block_broadcast(float x) {
     return x;
 }
 
+__device__ inline float block_broadcast(float x, int node) {
+    float tmp;
+    float y = x;
+    for (int i = 1; i <= 3; i++) {
+        if (__any_sync(0xffffffff, node == i)) {
+            tmp = __shfl_up_sync(0xffffffff, x, i * 8);
+            if (node == i)
+                y = tmp;
+        }
+        if (__any_sync(0xffffffff, node == -i)) {
+            tmp = __shfl_down_sync(0xffffffff, x, i * 8);
+            if (node == -i)
+                y = tmp;
+        }
+    }
+    return y;
+}
+
 __global__ void flash_gat_kernel(
     const float* __restrict__ x,
+    float* __restrict__ debug_out,
     float* __restrict__ out,
     const float* __restrict__ rotate,
     const float* __restrict__ ce_0_w,
@@ -297,8 +317,8 @@ __global__ void flash_gat_kernel(
     float xi = (mask & head_idx < 2) ? x[node_idx * 2 + head_idx] : 0;
     xi = cr_dot(cr, xi, head_idx);      // only head_idx < 2 is valid.
 
-    __shared__ float weight[64 * 8];
-    __shared__ float bias[64];
+    __shared__ float weight[64 * 2 + 3];    // avoid bank conflict.
+    __shared__ float bias[64 + 1];
 
     float ce1[8];
     float ce2[8];
@@ -328,7 +348,9 @@ __global__ void flash_gat_kernel(
 
     __shared__ float alpha_sum[8];
     __shared__ float alpha_max[8];
-    __shared__ float out_sum[4 * 64];
+    __shared__ float out_sum[4 * 64 + 8];   // + 8 for avoid bank conflict.
+    for (int i = 0; i < 8; i++)
+        out_sum[i * 33 + threadIdx.x] = 0;
     __shared__ int node_i, begin0, end;
     if (threadIdx.x == 0) {
         node_i = 0;
@@ -345,15 +367,17 @@ __global__ void flash_gat_kernel(
         bool ei_mask = ei_ptr < end;
         int ei0 = ei_mask ? edge_index[ei_ptr] : -1;
         int ei1 = ei_mask ? edge_index[ei_ptr + e_size] : -1;
+        int node_offset = ei_mask ? threadIdx.x / 8 - (ei0 - node_idx_0) : 0;
         xi = (ei_mask & head_idx < 2) ? x[ei1 * 2 + head_idx] : 0;
-        xi = cr_dot(cr, xi, head_idx);      // only head_idx < 2 is valid.
+        float cr_0 = block_broadcast(cr, node_offset);
+        xi = cr_dot(cr_0, xi, head_idx);      // only head_idx < 2 is valid.
         linear2(ce1, xi, weight, bias, nbr_0_w, nbr_0_b, head_idx);
         layer_norm(ce1, weight, bias, nbr_1_w, nbr_1_b, head_idx);
         relu(ce1);
         linear64(ce2, ce1, weight, bias, nbr_3_w, nbr_3_b, head_idx);
 
         xi = (ei_mask & head_idx < 2) ? edge_attr[ei_ptr * 2 + head_idx] : 0;
-        xi = cr_dot(cr, xi, head_idx);      // only head_idx < 2 is valid.
+        xi = cr_dot(cr_0, xi, head_idx);      // only head_idx < 2 is valid.
         linear2(ce1, xi, weight, bias, ea_0_w, ea_0_b, head_idx);
         layer_norm(ce1, weight, bias, ea_1_w, ea_1_b, head_idx);
         relu(ce1);
@@ -369,9 +393,15 @@ __global__ void flash_gat_kernel(
 
         float alpha = 0;
         for (int i = 0; i < 8; i++)
-            alpha += ce2[i] * ce3[i];
+            alpha += ce2[i] * block_broadcast(ce3[i], node_offset);
         alpha *= 0.353553391f;   // 1.0 / sqrtf(8.0);
         linear64(ce2, ce1, weight, bias, v_w, v_b, head_idx);     // value
+        // if (ei_mask)
+        //     debug_out[ei_ptr * 8 + head_idx] = alpha;
+        // if (node_idx_0 == 49516 && head_idx == 0)
+        //     printf("ei_ptr=%d, threadIdx.x / 8=%d, ei0=%d, ei1=%d, alpha=%f\n", ei_ptr, threadIdx.x / 8, ei0, ei1, alpha);
+        // if (node_idx_0 == 49516)
+        //     printf("    %d: alpha=%f\n", threadIdx.x, alpha);
 
         while (node_i < 4) {
             if (node_idx_0 + node_i >= x_size)
@@ -380,8 +410,6 @@ __global__ void flash_gat_kernel(
             int end_i = edge_begins[node_idx_0 + node_i + 1];
             bool mask_i = ei0 == node_idx_0 + node_i;
             if (end_i == begin_i) {
-                out_sum[node_i * 64 + threadIdx.x] = 0;
-                out_sum[node_i * 64 + threadIdx.x + 32] = 0;
                 if (threadIdx.x == 0)
                     node_i++;
                 __syncwarp();
@@ -394,14 +422,22 @@ __global__ void flash_gat_kernel(
                     alpha = expf(alpha - alpha_max_i);
                 alpha_sum_i = block_broadcast(block_sum(alpha, mask_i));
                 if (mask_i) {
+                    // if (node_idx_0 == 49516)
+                    //     printf("    %d_%d: first add to %d, sum=%f\n", threadIdx.x / 8, threadIdx.x, node_i, alpha_sum_i);
                     alpha /= alpha_sum_i;
-                    for (int i = 0; i < 8; i++)
+                    for (int i = 0; i < 8; i++) {
                         ce2[i] *= alpha;
+                        // if (node_idx_0 == 49516)
+                        //     printf("    %d: alpha=%f, ce2[%d]=%f\n", threadIdx.x, alpha, i, ce2[i]);
+                    }
                 }
                 for (int i = 0; i < 8; i++) {
                     float block_tmp = block_sum(ce2[i], mask_i);
-                    if (threadIdx.x < 8)
-                        out_sum[node_i * 64 + head_idx * 8 + i] = block_tmp;
+                    if (threadIdx.x < 8) {
+                        out_sum[node_i * 66 + head_idx * 8 + head_idx / 4 + i] = block_tmp;
+                        // if (node_idx_0 == 49516)
+                        //     printf("    %d: first node %d out[%d]=%f\n", threadIdx.x, node_i, i, block_tmp);
+                    }
                 }
                 if (threadIdx.x < 8)
                     alpha_max[head_idx] = alpha_max_i;
@@ -412,28 +448,31 @@ __global__ void flash_gat_kernel(
                     float delta = expf(alpha_max[head_idx] - alpha_max_i);
                     alpha_max[head_idx] = alpha_max_i;
                     alpha_sum[head_idx] *= delta;
-                    for (int i = 0; i < 8; i++) // maybe use all threads?
-                        out_sum[node_i * 64 + head_idx * 8 + i] *= delta;
                 }
                 __syncwarp();
                 if (mask_i)
-                    alpha = expf(alpha - alpha_max_i);
+                    alpha = expf(alpha - alpha_max[head_idx]);
                 alpha_sum_i = block_broadcast(block_sum(alpha, mask_i)) + alpha_sum[head_idx];
                 if (threadIdx.x < 8) {
                     float delta = alpha_sum[head_idx] / alpha_sum_i;
                     for (int i = 0; i < 8; i++)
-                        out_sum[node_i * 64 + head_idx * 8 + i] *= delta;
+                        out_sum[node_i * 66 + head_idx * 8 + head_idx / 4 + i] *= delta;
                 }
                 __syncwarp();
                 if (mask_i) {
+                    // if (node_idx_0 == 49516)
+                    //     printf("    %d_%d: nofst add to %d, sum=%f\n", threadIdx.x / 8, threadIdx.x, node_i, alpha_sum_i);
                     alpha /= alpha_sum_i;
                     for (int i = 0; i < 8; i++)
                         ce2[i] *= alpha;
                 }
                 for (int i = 0; i < 8; i++) {
                     float block_tmp = block_sum(ce2[i], mask_i);
-                    if (threadIdx.x < 8)
-                        out_sum[node_i * 64 + head_idx * 8 + i] += block_tmp;
+                    if (threadIdx.x < 8) {
+                        out_sum[node_i * 66 + head_idx * 8 + head_idx / 4 + i] += block_tmp;
+                        // if (node_idx_0 == 49516)
+                        //     printf("    %d: nofst node %d out[%d]+=%f\n", threadIdx.x, node_i, i, block_tmp);
+                    }
                 }
             }
             if (threadIdx.x < 8)
@@ -450,9 +489,10 @@ __global__ void flash_gat_kernel(
     }
     if (mask) {
         for (int i = 0; i < 8; i++) {
-            ce1[i] = out_sum[(threadIdx.x / 8) * 64 + head_idx * 8 + i];
+            ce1[i] = out_sum[(threadIdx.x / 8) * 66 + head_idx * 8 + head_idx / 4 + i];
             ce2[i] = out[node_idx * 64 + head_idx * 8 + i];     // old ce
             ce3[i] = ce2[i];
+            // debug_out[node_idx * 64 + head_idx * 8 + i] = ce1[i];
         }
     }
     layer_norm(ce2, weight, bias, n1_w, n1_b, head_idx);
@@ -476,7 +516,7 @@ __global__ void flash_gat_kernel(
 }
 
 at::Tensor flash_gat(
-    at::Tensor x, at::Tensor out, at::Tensor rotate,
+    at::Tensor x, at::Tensor debug_out, at::Tensor out, at::Tensor rotate,
     at::Tensor ce_0_w, at::Tensor ce_0_b,
     at::Tensor ce_1_w, at::Tensor ce_1_b,
     at::Tensor ce_3_w, at::Tensor ce_3_b,
@@ -510,6 +550,7 @@ at::Tensor flash_gat(
     const int blocks = ceil(float(x.sizes()[0]) * 8 / threads);
     flash_gat_kernel<<<blocks, threads>>>(
         x.data_ptr<float>(),
+        debug_out.data_ptr<float>(),
         out.data_ptr<float>(),
         rotate.data_ptr<float>(),
         ce_0_w.data_ptr<float>(),
@@ -576,6 +617,6 @@ at::Tensor flash_gat(
     return out;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("flash_gat", &flash_gat, "flash_gat");
-}
+// PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+//   m.def("flash_gat", &flash_gat, "flash_gat");
+// }

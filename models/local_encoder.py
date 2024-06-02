@@ -142,7 +142,7 @@ class AAEncoder(torch.nn.Module):
                    edge_attr: torch.Tensor,
                    bos_mask: torch.Tensor,
                    rotate_mat: torch.Tensor) -> torch.Tensor:
-        return self.forward_pt(x, t, edge_index, edge_attr, bos_mask, rotate_mat)
+        return self.forward_flash(x, t, edge_index, edge_attr, bos_mask, rotate_mat)
 
     def forward_pt(self,
                    x: torch.Tensor,
@@ -213,7 +213,7 @@ class AAEncoder(torch.nn.Module):
 
         center_embed = torch.zeros(x.shape[0], 64, device=x.device)
         if True:
-            flash_gat.flash_gat(x, center_embed, rotate_mat,
+            flash_gat.flash_gat(x, x, center_embed, rotate_mat,
                 self.center_embed.embed[0].weight, self.center_embed.embed[0].bias,
                 self.center_embed.embed[1].weight, self.center_embed.embed[1].bias,
                 self.center_embed.embed[3].weight, self.center_embed.embed[3].bias,
